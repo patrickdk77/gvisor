@@ -483,6 +483,9 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 	newPk.tuple = pk.tuple
 	newPk.Mark = pk.Mark
 	newPk.InputNICID = pk.InputNICID
+	newPk.GSOOptions = pk.GSOOptions
+	newPk.RXChecksumValidated = pk.RXChecksumValidated
+	newPk.Hash = pk.Hash
 
 	return newPk
 }
@@ -1131,6 +1134,12 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		if !ok || isICMPError {
 			return
 		}
+	}
+
+	gso := &pk.GSOOptions
+	needsOnlyPartialCsum := gso.Type != GSONone && gso.NeedsCsum
+	if needsOnlyPartialCsum {
+		return
 	}
 
 	var xsum uint16
