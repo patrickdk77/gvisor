@@ -164,9 +164,12 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
 		return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
 	}
 
-	// Docker uses AppArmor by default, so just log that it's being ignored.
-	if spec.Process.ApparmorProfile != "" {
-		log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
+	// The application's syscalls never reach the host kernel, so an
+	// AppArmor profile can only confine the sentry and gofer. It is
+	// applied only when explicitly requested; see
+	// specutils/apparmor.go.
+	if spec.Process.ApparmorProfile != "" && conf.HostAppArmor != config.HostAppArmorSpec {
+		log.Warningf("AppArmor profile %q is being ignored; pass --host-apparmor=spec to apply it to the sentry and gofer", spec.Process.ApparmorProfile)
 	}
 
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {

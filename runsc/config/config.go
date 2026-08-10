@@ -361,6 +361,13 @@ type Config struct {
 	// Zero disables time-based eviction.
 	DCacheTTL time.Duration `flag:"dcache-ttl"`
 
+	// HostAppArmor controls whether the AppArmor profile named in the
+	// OCI spec is applied to the sentry and gofer processes, confining
+	// the host accesses they make on the application's behalf. Profiles
+	// must be written for those processes; see
+	// runsc/specutils/apparmor.go.
+	HostAppArmor HostAppArmorPolicy `flag:"host-apparmor"`
+
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`
@@ -1649,6 +1656,57 @@ func (p SignalUnkillablePolicy) String() string {
 		return "linux"
 	default:
 		panic(fmt.Sprintf("invalid signal unkillable policy %d", p))
+	}
+}
+
+// HostAppArmorPolicy dictates whether the AppArmor profile named in the OCI
+// spec is applied to the sentry and gofer processes.
+type HostAppArmorPolicy int
+
+// HostAppArmorPolicy values.
+const (
+	// HostAppArmorNone does not apply any AppArmor profile to the sentry
+	// and gofer. A profile named in the spec is ignored with a warning.
+	HostAppArmorNone HostAppArmorPolicy = iota
+
+	// HostAppArmorSpec applies the profile named in the OCI spec to the
+	// sentry and gofer processes.
+	HostAppArmorSpec
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *HostAppArmorPolicy) Set(v string) error {
+	switch v {
+	case "none":
+		*p = HostAppArmorNone
+	case "spec":
+		*p = HostAppArmorSpec
+	default:
+		return fmt.Errorf("invalid host-apparmor policy %q (must be one of: none, spec)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p HostAppArmorPolicy) Ptr() *HostAppArmorPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *HostAppArmorPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p HostAppArmorPolicy) String() string {
+	switch p {
+	case HostAppArmorNone:
+		return "none"
+	case HostAppArmorSpec:
+		return "spec"
+	default:
+		panic(fmt.Sprintf("invalid host-apparmor policy %d", p))
 	}
 }
 

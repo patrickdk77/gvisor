@@ -8,6 +8,7 @@ package(
 go_library(
     name = "specutils",
     srcs = [
+        "apparmor.go",
         "cri.go",
         "fs.go",
         "gofer_conf.go",
