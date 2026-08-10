@@ -151,6 +151,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Duration("dcache-ttl", 0, "if non-zero, cached dentries left unused for this duration are evicted, closing their host FDs. Applies to both per-mount and global dentry caches. Zero (default) disables time-based eviction.")
+	flagSet.Bool("host-apparmor", false, "apply the AppArmor profile from the OCI spec to the sentry and gofer processes. The application's syscalls are handled by the sentry and never reach the host kernel, so the profile confines host accesses made on its behalf, using the sentry/gofer's own paths. Profiles written for runc containers will not work unmodified.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
 	flagSet.Bool("directfs", true, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
 	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")

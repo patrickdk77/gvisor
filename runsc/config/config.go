@@ -344,6 +344,12 @@ type Config struct {
 	// Zero disables time-based eviction.
 	DCacheTTL time.Duration `flag:"dcache-ttl"`
 
+	// HostAppArmor applies the AppArmor profile named in the OCI spec
+	// to the sentry and gofer processes, confining the host accesses
+	// they make on the application's behalf. Profiles must be written
+	// for those processes; see runsc/specutils/apparmor.go.
+	HostAppArmor bool `flag:"host-apparmor"`
+
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`

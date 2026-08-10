@@ -121,6 +121,12 @@ type Gofer struct {
 	profileFDs       profile.FDArgs
 	syncFDs          goferSyncFDs
 	stopProfiling    func()
+
+	// aaProfile is the AppArmor profile to enter once setup is done. It
+	// is prepared before the chroot, because the kernel interfaces used
+	// to enter a profile are not reachable afterwards. Nil if no profile
+	// was requested.
+	aaProfile *specutils.AppArmorProfile
 }
 
 // Name implements subcommands.Command.
@@ -185,7 +191,9 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// Whether this process will re-execute itself to apply credential and
 	// capability changes, rather than applying capabilities in-process.
 	// Computed before the sync FDs are consumed below.
-	willReexec := g.applyCaps && (config.CgoEnabled || g.syncFDs.usernsFD >= 0)
+	// An AppArmor profile is entered at exec (see specutils/apparmor.go),
+	// so re-exec even when capabilities alone would not require it.
+	willReexec := g.applyCaps && (config.CgoEnabled || g.syncFDs.usernsFD >= 0 || conf.HostAppArmor)
 
 	specFile := os.NewFile(uintptr(g.specFD), "spec file")
 	defer specFile.Close()
@@ -202,6 +210,28 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("parsing rootfs hint: %v", err)
 	}
 	lisafsNeeded := lisafsNeededForDirectFSSuppression(spec, mountHints, rootfsHint, g.mountConfs)
+
+	// The AppArmor interfaces live in /proc and /sys, which are gone
+	// after the chroot below, so open them now and enter the profile
+	// later, once privileged setup is done.
+	// Arm the profile only in the invocation that will re-exec; the
+	// re-exec'd gofer is already running under the profile. Log the label
+	// it ended up with, while /proc is still reachable, so that
+	// confinement is verifiable.
+	if conf.HostAppArmor && spec.Process.ApparmorProfile != "" {
+		if willReexec {
+			var err error
+			if g.aaProfile, err = specutils.PrepareAppArmorProfile(spec.Process.ApparmorProfile); err != nil {
+				util.Fatalf("gofer: %v", err)
+			}
+		} else if g.applyCaps {
+			// Capabilities are being applied in-process, so there is no
+			// exec to attach the profile to.
+			util.Fatalf("gofer: cannot apply AppArmor profile %q: entering a profile requires an exec, but this gofer will not re-exec", spec.Process.ApparmorProfile)
+		} else {
+			specutils.LogAppArmorLabel("gofer")
+		}
+	}
 
 	g.syncFDs.syncChroot()
 	g.syncFDs.syncUsernsForRootless(uint32(g.uid), uint32(g.gid))
@@ -251,6 +281,13 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 				overrides[key] = value
 			}
 			args := sandboxsetup.PrepareArgs(g.Name(), f, overrides)
+			// Enter the AppArmor profile at this exec: root FS setup is
+			// done, so the profile need not permit mounting. This locks
+			// the goroutine to its thread, which is required because the
+			// pending profile is per-task.
+			if err := g.aaProfile.SetOnExec(); err != nil {
+				util.Fatalf("gofer: %v", err)
+			}
 			util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, capsToApply, sandboxsetup.SetCapsAndCallSelf(args, capsToApply))
 			panic("unreachable")
 		}
