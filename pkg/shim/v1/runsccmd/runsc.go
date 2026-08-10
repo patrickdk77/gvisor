@@ -752,7 +752,7 @@ func (c *directStatsClient) stats(context context.Context, id string) (*runc.Sta
 		return nil, err
 	}
 	path := c.controlSocketPath
-	var socketFD int = -1
+	socketFD := -1
 	if len(path) >= 108 {
 		fd, err := unix.Open(path, unix.O_PATH, 0)
 		if err != nil {
