@@ -2979,7 +2979,14 @@ func (e *Endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketB
 	// TODO(gvisor.dev/issues/5270): Handle all transport errors.
 	switch transErr.Kind() {
 	case stack.PacketTooBigTransportError:
-		handlePacketTooBig(transErr.Info())
+		e.mu.Lock()
+		pmtud := e.pmtud
+		e.mu.Unlock()
+		if pmtud == tcpip.PMTUDiscoveryProbe {
+			e.onICMPError(&tcpip.ErrMessageTooLong{}, transErr, pkt)
+		} else {
+			handlePacketTooBig(transErr.Info())
+		}
 	case stack.DestinationHostUnreachableTransportError:
 		e.onICMPError(&tcpip.ErrHostUnreachable{}, transErr, pkt)
 	case stack.DestinationNetworkUnreachableTransportError:
