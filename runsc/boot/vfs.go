@@ -1179,6 +1179,12 @@ func ParseMountOptions(opts []string) *vfs.MountOptions {
 		switch o {
 		case "ro":
 			mountOpts.ReadOnly = true
+		case "rro":
+			// A single sentry mount covers the whole subtree,
+			// so read-only is recursive by construction. The
+			// host-side recursion is applied by the gofer via
+			// mount_setattr(AT_RECURSIVE).
+			mountOpts.ReadOnly = true
 		case "noatime":
 			mountOpts.Flags.NoATime = true
 		case "noexec":
