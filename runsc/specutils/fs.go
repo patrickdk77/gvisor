@@ -121,6 +121,19 @@ func IsReadonlyMount(opts []string) bool {
 	return false
 }
 
+// RROOption requests a recursively read-only mount. It is not a
+// mount(2) flag: the gofer applies it with mount_setattr(2) and
+// AT_RECURSIVE so the whole host subtree becomes read-only, and the
+// sentry mounts the volume read-only (a single sentry mount covers
+// the subtree, so read-only is recursive by construction there).
+const RROOption = "rro"
+
+// IsRROMount returns true if opts requests a recursively read-only
+// mount.
+func IsRROMount(opts []string) bool {
+	return slices.Contains(opts, RROOption)
+}
+
 // validateMount validates that spec mounts are correct.
 func validateMount(mnt *specs.Mount) error {
 	if !path.IsAbs(mnt.Destination) {
@@ -184,13 +197,14 @@ func validatePropagation(opt string) error {
 // KnownMountOptions returns a sorted list of all supported mount options.
 // Used by `runsc features`.
 func KnownMountOptions() []string {
-	res := make([]string, 0, len(optionsMap)+len(propOptionsMap))
+	res := make([]string, 0, len(optionsMap)+len(propOptionsMap)+1)
 	for k := range optionsMap {
 		res = append(res, k)
 	}
 	for k := range propOptionsMap {
 		res = append(res, k)
 	}
+	res = append(res, RROOption)
 	sort.Strings(res)
 	return res
 }

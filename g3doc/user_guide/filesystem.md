@@ -253,6 +253,36 @@ cache: a path accessed less often than the TTL becomes a cache miss, which for a
 network-backed filesystem means a round trip. Note that after checkpoint and
 restore, sweepers are not restarted and caches fall back to size-based eviction.
 
+## Recursively Read-Only Mounts
+
+gVisor supports the `rro` mount option, which makes a mount read-only along with
+every mount beneath it, so that a writable mount nested inside a read-only one
+does not become a hole in it:
+
+```json
+    "mounts": [
+        {
+            "type": "bind",
+            "source": "/host/path",
+            "destination": "/container/path",
+            "options": [
+                "rro"
+            ]
+        }
+    ]
+```
+
+In Kubernetes this is requested with `volumeMounts[].recursiveReadOnly`, which
+kubelet translates into this option. On the host side the gofer applies it with
+`mount_setattr(2)` and `AT_RECURSIVE`, so it requires Linux 5.12 or later; inside
+the sandbox the mount is read-only, which covers the subtree because a single
+sentry mount spans it.
+
+Note that containerd only requests recursively read-only mounts from a runtime
+that advertises support for them, which runsc reports through its runtime
+features. Confirm with `crictl info`, whose `runtimeHandlers` entry for runsc
+should show `recursive_read_only_mounts: true`.
+
 ## EROFS Support
 
 gVisor supports EROFS (Enhanced Read-Only File System) rootfs and mounts. It is
