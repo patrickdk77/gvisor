@@ -612,7 +612,8 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		// Options field). So assume root is always on top of overlayfs.
 		data = append(data, "overlayfs_stale_read")
 
-		// Configure the gofer dentry cache size.
+		// Configure the gofer dentry cache size and idle TTL.
+		gofer.SetDentryCacheTTL(conf.DCacheTTL)
 		gofer.SetDentryCacheSize(conf.DCache)
 
 		opts = &vfs.MountOptions{

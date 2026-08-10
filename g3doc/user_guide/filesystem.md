@@ -215,6 +215,44 @@ can be configured in two ways:
     ]
 ```
 
+### Idle Eviction
+
+The cache is bounded by size alone: an entry is evicted only when a newer entry
+needs its slot. A dentry that is touched once and never used again therefore
+stays cached indefinitely, and with directfs each cached dentry holds an open
+host file descriptor. Workloads that walk a large tree once (an integrity scan,
+a backup pass, a startup checksum) can leave a mount's cache full of entries
+that will never be reused.
+
+The `--dcache-ttl` flag makes cached dentries expire when they go unused,
+releasing their host FDs:
+
+```json
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc",
+            "runtimeArgs": [
+                "--dcache-ttl=90s"
+            ]
+       }
+    }
+}
+```
+
+A background sweeper evicts entries that have been unused for longer than the
+TTL, checking at a quarter of the TTL (bounded to between 10 and 60 seconds), so
+eviction happens somewhat after the TTL rather than exactly at it. An entry's
+timer resets whenever the dentry is used again, so frequently accessed paths are
+never evicted by the sweeper; only genuinely idle entries are. It applies to
+per-mount caches and to the global cache alike.
+
+The default of `0` disables idle eviction, leaving the size-based behavior
+described above. Setting a TTL trades cache hit rate for a smaller resident
+cache: a path accessed less often than the TTL becomes a cache miss, which for a
+network-backed filesystem means a round trip. Note that after checkpoint and
+restore, sweepers are not restarted and caches fall back to size-based eviction.
+
 ## EROFS Support
 
 gVisor supports EROFS (Enhanced Read-Only File System) rootfs and mounts. It is

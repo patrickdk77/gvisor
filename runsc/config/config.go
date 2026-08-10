@@ -339,6 +339,11 @@ type Config struct {
 	// used.
 	DCache int `flag:"dcache"`
 
+	// DCacheTTL is the idle duration after which unreferenced gofer
+	// dentry cache entries are evicted, releasing their host FDs.
+	// Zero disables time-based eviction.
+	DCacheTTL time.Duration `flag:"dcache-ttl"`
+
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`

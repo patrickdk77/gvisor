@@ -47,6 +47,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -150,6 +151,13 @@ type dentryCache struct {
 	// maxCachedDentries is the maximum number of cacheable dentries.
 	// maxCachedDentries is immutable.
 	maxCachedDentries uint64
+	// ttl is the idle duration after which an unreferenced cached
+	// dentry is evicted by the background sweeper, releasing its
+	// host FDs. A zero ttl disables time-based eviction. ttl is
+	// immutable.
+	ttl time.Duration
+	// sweeperStop signals the background sweeper (if any) to exit.
+	sweeperStop chan struct{} `state:"nosave"`
 	// mu protects the below fields.
 	mu sync.Mutex `state:"nosave"`
 	// dentries contains all dentries with 0 references. Due to race conditions,
@@ -168,11 +176,92 @@ func SetDentryCacheSize(size int) {
 		log.Warningf("Global dentry cache has already been initialized. Ignoring subsequent attempt.")
 		return
 	}
-	globalDentryCache = &dentryCache{maxCachedDentries: uint64(size)}
+	globalDentryCache = &dentryCache{
+		maxCachedDentries: uint64(size),
+		ttl:               dentryCacheTTL,
+	}
+	globalDentryCache.startSweeper()
 }
+
+// SetDentryCacheTTL sets the idle duration after which unreferenced
+// cached dentries are evicted, releasing their host FDs. It must be
+// called before any gofer filesystem is configured. A zero value (the
+// default) disables time-based eviction.
+func SetDentryCacheTTL(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	dentryCacheTTL = d
+}
+
+// dentryCacheTTL is the idle eviction TTL applied to dentry caches
+// created after SetDentryCacheTTL.
+var dentryCacheTTL time.Duration
 
 // globalDentryCache is a global cache of dentries across all gofer clients.
 var globalDentryCache *dentryCache
+
+// cacheClockBase is the reference point for dentry idle timestamps.
+// time.Since(cacheClockBase) yields monotonic nanoseconds unaffected
+// by wall clock jumps.
+var cacheClockBase = time.Now()
+
+func cacheNowNanos() int64 {
+	return time.Since(cacheClockBase).Nanoseconds()
+}
+
+// startSweeper starts a background goroutine that evicts cached
+// dentries left unreferenced and untouched for longer than dc.ttl.
+// It is a no-op if dc.ttl is zero.
+func (dc *dentryCache) startSweeper() {
+	if dc.ttl == 0 {
+		return
+	}
+	dc.sweeperStop = make(chan struct{})
+	interval := dc.ttl / 4
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	// S/R-SAFE: private-cache sweepers are stopped on filesystem
+	// release, and sweeper goroutines are not restarted after
+	// restore, so restored caches fall back to size-based eviction
+	// only.
+	go dc.sweep(interval)
+}
+
+// sweep evicts stale cached dentries every interval until stopped.
+// The LRU list is ordered by last cache insertion (checkCachingLocked
+// refreshes cachedAt when moving an entry to the front), so eviction
+// stops at the first entry younger than the TTL.
+func (dc *dentryCache) sweep(interval time.Duration) {
+	ctx := context.Background()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-dc.sweeperStop:
+			return
+		case <-ticker.C:
+		}
+		for {
+			dc.mu.Lock()
+			victim := dc.dentries.Back()
+			stale := victim != nil &&
+				cacheNowNanos()-victim.d.cachedAt.Load() >= dc.ttl.Nanoseconds()
+			dc.mu.Unlock()
+			if !stale {
+				break
+			}
+			// evict() re-checks refs and watches under the
+			// appropriate locks, so racing ref-takers and
+			// already-destroyed dentries are handled safely.
+			victim.d.evict(ctx)
+		}
+	}
+}
 
 // Valid values for "trans" mount option.
 const transportModeFD = "fd"
@@ -602,7 +691,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if globalDentryCache != nil {
 		fs.dentryCache = globalDentryCache
 	} else {
-		fs.dentryCache = &dentryCache{maxCachedDentries: fsopts.dcache}
+		fs.dentryCache = &dentryCache{
+			maxCachedDentries: fsopts.dcache,
+			ttl:               dentryCacheTTL,
+		}
+		fs.dentryCache.startSweeper()
 	}
 
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
@@ -728,6 +821,14 @@ func getFDFromMountOptionsMap(ctx context.Context, mopts map[string]string) (int
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.released.Store(1)
+
+	// Stop the idle sweeper of a private dentry cache. The global
+	// cache (shared across filesystems) keeps its sweeper for the
+	// sandbox lifetime.
+	if fs.dentryCache != globalDentryCache &&
+		fs.dentryCache.sweeperStop != nil {
+		close(fs.dentryCache.sweeperStop)
+	}
 
 	mf := fs.mf
 	fs.syncMu.Lock()
@@ -1114,6 +1215,11 @@ type dentry struct {
 	// cacheEntry links dentry into filesystem.dentryCache.dentries. It is
 	// protected by filesystem.dentryCache.mu.
 	cacheEntry dentryListElem
+
+	// cachedAt is the time, in nanoseconds since cacheClockBase, at
+	// which this dentry was last inserted into or refreshed in the
+	// dentry cache. It is only meaningful while cached is true.
+	cachedAt atomicbitops.Int64 `state:"nosave"`
 
 	// syncableListEntry links dentry into filesystem.syncableDentries. It is
 	// protected by filesystem.syncMu.
@@ -1751,6 +1857,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 	d.inode.fs.dentryCache.mu.Lock()
 	// If d is already cached, just move it to the front of the LRU.
 	if d.cached {
+		d.cachedAt.Store(cacheNowNanos())
 		d.inode.fs.dentryCache.dentries.Remove(&d.cacheEntry)
 		d.inode.fs.dentryCache.dentries.PushFront(&d.cacheEntry)
 		d.inode.fs.dentryCache.mu.Unlock()
@@ -1759,6 +1866,7 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 	}
 	// Cache the dentry, then evict the least recently used cached dentry if
 	// the cache becomes over-full.
+	d.cachedAt.Store(cacheNowNanos())
 	d.inode.fs.dentryCache.dentries.PushFront(&d.cacheEntry)
 	d.inode.fs.dentryCache.dentriesLen++
 	d.cached = true
