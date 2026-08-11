@@ -344,6 +344,11 @@ type Config struct {
 	// Zero disables time-based eviction.
 	DCacheTTL time.Duration `flag:"dcache-ttl"`
 
+	// RevalidateTTL is how long cached file metadata is trusted on mounts
+	// shared with other users of the host filesystem before it is
+	// revalidated. Zero revalidates on every access.
+	RevalidateTTL time.Duration `flag:"revalidate-ttl"`
+
 	// ProcHidePid sets the hidepid= option on the container's /proc mount,
 	// which controls whether a task can see other users' processes. Empty
 	// leaves /proc as the runtime mounts it. See proc(5).

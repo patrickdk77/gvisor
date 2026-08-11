@@ -198,6 +198,23 @@ func SetDentryCacheTTL(d time.Duration) {
 // created after SetDentryCacheTTL.
 var dentryCacheTTL time.Duration
 
+// SetRevalidateTTL sets how long a dentry's cached metadata is trusted
+// before it is revalidated on a mount where other users of the remote
+// filesystem may mutate it (InteropModeShared). It must be called before
+// any gofer filesystem is configured. A zero value (the default)
+// revalidates on every access.
+func SetRevalidateTTL(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	revalidateTTL = d.Nanoseconds()
+}
+
+// revalidateTTL is the duration, in nanoseconds, for which cached
+// metadata is trusted on shared mounts. Zero disables it. It is set
+// before any filesystem exists and read-only afterwards.
+var revalidateTTL int64
+
 // globalDentryCache is a global cache of dentries across all gofer clients.
 var globalDentryCache *dentryCache
 
@@ -966,6 +983,12 @@ type inode struct {
 	gid        atomicbitops.Uint32 // auth.KGID, but ...
 	blockSize  atomicbitops.Uint32 // 0 if unknown
 	// Timestamps, all nsecs from the Unix epoch.
+	// attrsAt is when this inode's metadata was last refreshed from the
+	// remote filesystem, on the clock cacheNowNanos() reads. It is only
+	// used to decide whether revalidation may be skipped; see
+	// revalidateTTL.
+	attrsAt atomicbitops.Int64
+
 	atime atomicbitops.Int64
 	mtime atomicbitops.Int64
 	ctime atomicbitops.Int64

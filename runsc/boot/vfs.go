@@ -633,6 +633,14 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 	}
 	suppressDirectFS := rootfsHint != nil && rootfsHint.SuppressDirectFS
 
+	// Configure the gofer dentry cache and revalidation before any gofer
+	// filesystem is mounted. These are global to the sandbox and apply to
+	// submounts as well, so they must be set whatever the root filesystem
+	// turns out to be.
+	gofer.SetDentryCacheTTL(conf.DCacheTTL)
+	gofer.SetRevalidateTTL(conf.RevalidateTTL)
+	gofer.SetDentryCacheSize(conf.DCache)
+
 	var (
 		fsName string
 		opts   *vfs.MountOptions
@@ -647,10 +655,6 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		// can only send mount options for specs.Mounts (specs.Root is missing
 		// Options field). So assume root is always on top of overlayfs.
 		data = append(data, "overlayfs_stale_read")
-
-		// Configure the gofer dentry cache size and idle TTL.
-		gofer.SetDentryCacheTTL(conf.DCacheTTL)
-		gofer.SetDentryCacheSize(conf.DCache)
 
 		opts = &vfs.MountOptions{
 			ReadOnly: c.root.Readonly,
