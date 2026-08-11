@@ -135,6 +135,7 @@ go_test(
     name = "proc_test",
     size = "small",
     srcs = [
+        "hidepid_test.go",
         "tasks_sys_test.go",
         "tasks_test.go",
     ],
