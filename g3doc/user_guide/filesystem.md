@@ -283,6 +283,49 @@ that advertises support for them, which runsc reports through its runtime
 features. Confirm with `crictl info`, whose `runtimeHandlers` entry for runsc
 should show `recursive_read_only_mounts: true`.
 
+## Hiding Other Users' Processes
+
+By default every task in a sandbox can see every other task's directory under
+`/proc`, regardless of which user owns it, so `ps` lists all of them. The
+`hidepid=` mount option restricts this, as it does on a host kernel (see
+proc(5)):
+
+*   `hidepid=0` (or `off`): no restriction. This is the default.
+*   `hidepid=1` (or `noaccess`): a task may not access the `/proc` directories
+    of other users' processes. The directories themselves remain listed, so the
+    existence of a process is still discoverable.
+*   `hidepid=2` (or `invisible`): as `hidepid=1`, and the directories of other
+    users' processes are hidden entirely, so `ps` shows only the caller's own
+    processes and other processes cannot be enumerated.
+
+A task always sees its own thread group, and a task holding `CAP_SYS_PTRACE` in
+the target's user namespace sees all of them.
+
+Because the container's `/proc` is mounted by the runtime rather than by the
+application, the option is usually set with a flag rather than in the mount:
+
+```json
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc",
+            "runtimeArgs": [
+                "--proc-hidepid=2"
+            ]
+       }
+    }
+}
+```
+
+The `hidepid=` option is also accepted directly on a `proc` mount in the OCI
+spec, which takes precedence over the flag.
+
+Two differences from a host kernel: with `hidepid=1` gVisor denies the lookup of
+another user's process directory outright, where Linux keeps the directory
+itself accessible and denies only its contents; and the `hidepid=4`
+(`ptraceable`) mode and the `gid=` option that exempts a group are not
+implemented.
+
 ## EROFS Support
 
 gVisor supports EROFS (Enhanced Read-Only File System) rootfs and mounts. It is

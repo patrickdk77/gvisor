@@ -344,6 +344,11 @@ type Config struct {
 	// Zero disables time-based eviction.
 	DCacheTTL time.Duration `flag:"dcache-ttl"`
 
+	// ProcHidePid sets the hidepid= option on the container's /proc mount,
+	// which controls whether a task can see other users' processes. Empty
+	// leaves /proc as the runtime mounts it. See proc(5).
+	ProcHidePid string `flag:"proc-hidepid"`
+
 	// AppArmorPolicySource selects where AppArmor profiles are read from in
 	// order to derive in-sandbox confinement policy: "none" (the default,
 	// no in-sandbox confinement), "host" (read from the host, keeping

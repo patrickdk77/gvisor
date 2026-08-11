@@ -1114,6 +1114,11 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 
 	case proc.Name:
 		internalData = newProcInternalData(conf, spec)
+		// Hide other users' processes when configured; see
+		// --proc-hidepid.
+		if len(conf.ProcHidePid) != 0 {
+			data = append(data, "hidepid="+conf.ProcHidePid)
+		}
 
 	case sys.Name:
 		sysData := &sys.InternalData{

@@ -52,7 +52,43 @@ type filesystem struct {
 	kernfs.Filesystem
 
 	devMinor uint32
+
+	// hidePid restricts which task directories are visible in /proc, per the
+	// hidepid= mount option. hidePid is immutable.
+	hidePid HidePidMode
 }
+
+// HidePidMode is the value of the hidepid= mount option, which controls the
+// visibility of other users' processes in /proc. See proc(5).
+type HidePidMode uint8
+
+// parseHidePid parses the value of the hidepid= mount option. Both the
+// numeric and the named forms accepted by Linux are supported.
+func parseHidePid(str string) (HidePidMode, error) {
+	switch str {
+	case "0", "off":
+		return HidePidOff, nil
+	case "1", "noaccess":
+		return HidePidNoAccess, nil
+	case "2", "invisible":
+		return HidePidInvisible, nil
+	}
+	return HidePidOff, linuxerr.EINVAL
+}
+
+// Values of HidePidMode, matching the values of hidepid=.
+const (
+	// HidePidOff makes all task directories visible to all tasks, which is
+	// the default.
+	HidePidOff HidePidMode = 0
+
+	// HidePidNoAccess keeps task directories visible but denies access to
+	// those of other users.
+	HidePidNoAccess HidePidMode = 1
+
+	// HidePidInvisible hides the task directories of other users entirely.
+	HidePidInvisible HidePidMode = 2
+)
 
 func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
 	d, err := fs.GetDentryAt(ctx, rp, vfs.GetDentryOptions{})
@@ -80,6 +116,15 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	maxCachedDentries := defaultMaxCachedDentries
+	var hidePid HidePidMode
+	if str, ok := mopts["hidepid"]; ok {
+		delete(mopts, "hidepid")
+		var err error
+		if hidePid, err = parseHidePid(str); err != nil {
+			ctx.Warningf("procfs.FilesystemType.GetFilesystem: invalid hidepid: %q", str)
+			return nil, nil, err
+		}
+	}
 	if str, ok := mopts["dentry_cache_limit"]; ok {
 		delete(mopts, "dentry_cache_limit")
 		maxCachedDentries, err = strconv.ParseUint(str, 10, 64)
@@ -91,6 +136,7 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 
 	procfs := &filesystem{
 		devMinor: devMinor,
+		hidePid:  hidePid,
 	}
 	procfs.MaxCachedDentries = maxCachedDentries
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
