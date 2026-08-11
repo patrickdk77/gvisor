@@ -18,6 +18,7 @@ go_library(
     marshal_debug = True,
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        "//pkg/sentry/confine",
         "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",

@@ -91,6 +91,7 @@ go_library(
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/ebpffd",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/eventfd",
         "//pkg/sentry/fsimpl/fsconfigfd",
         "//pkg/sentry/fsimpl/host",

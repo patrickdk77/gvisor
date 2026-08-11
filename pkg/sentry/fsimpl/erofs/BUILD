@@ -55,6 +55,7 @@ go_library(
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        "//pkg/sentry/confine",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/cleanup",

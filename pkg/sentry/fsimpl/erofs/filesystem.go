@@ -36,7 +36,7 @@ func step(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*dentry, bool,
 	if !d.inode.IsDir() {
 		return nil, false, linuxerr.ENOTDIR
 	}
-	if err := d.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, false, err
 	}
 	name := rp.Component()
@@ -152,7 +152,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	defer parentDir.DecRef(ctx)
 	// Order of checks is important. First check if parent directory can be
 	// executed, then check for existence, and lastly check if mount is writable.
-	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
@@ -193,7 +193,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if ats.MayWrite() {
 		return linuxerr.EROFS
 	}
-	return d.inode.checkPermissions(creds, ats)
+	return d.checkPermissions(creds, ats)
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
@@ -207,7 +207,7 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 			d.DecRef(ctx)
 			return nil, linuxerr.ENOTDIR
 		}
-		if err := d.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+		if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 			d.DecRef(ctx)
 			return nil, err
 		}
@@ -274,7 +274,7 @@ afterTrailingSymlink:
 	}
 	defer parentDir.DecRef(ctx)
 	// Check for search permission in the parent directory.
-	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
 	// Reject attempts to open directories with O_CREAT.
@@ -340,11 +340,11 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if mnt != oldParentVD.Mount() {
 		return linuxerr.EXDEV
 	}
-	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := newParentDir.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	oldParentDir := oldParentVD.Dentry().Impl().(*dentry)
-	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := oldParentDir.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	return linuxerr.EROFS
@@ -357,7 +357,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	defer parentDir.DecRef(ctx)
-	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
@@ -415,7 +415,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		return err
 	}
 	defer parentDir.DecRef(ctx)
-	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
@@ -432,7 +432,7 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 		return nil, err
 	}
 	defer d.DecRef(ctx)
-	if err := d.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return nil, err
 	}
 	return nil, linuxerr.ECONNREFUSED

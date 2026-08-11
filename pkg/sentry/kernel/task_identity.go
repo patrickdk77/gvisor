@@ -17,6 +17,7 @@ package kernel
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 )
@@ -435,6 +436,32 @@ func (t *Task) SetKeepCaps(k bool) {
 	creds := t.Credentials().Fork() // The credentials object is immutable. See doc for creds.
 	creds.KeepCaps = k
 	t.creds.Store(creds)
+}
+
+// EnterConfinementProfile makes the task enter the named in-sandbox
+// confinement profile. A confined task may only enter a profile its own
+// profile's change_profile rules permit, so that a compromised task cannot
+// escape by entering a weaker profile, and it can never become unconfined.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) EnterConfinementProfile(name string) error {
+	if len(name) == 0 {
+		return linuxerr.EINVAL
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	if creds.ConfinementProfile == name {
+		return nil
+	}
+	if err := confine.CheckChangeProfile(creds.ConfinementProfile, name); err != nil {
+		return err
+	}
+	// The credentials object is immutable. See doc for creds.
+	newCreds := creds.Fork()
+	newCreds.ConfinementProfile = name
+	t.creds.Store(newCreds)
+	return nil
 }
 
 // PrivilegedSecureBits is the set of securebits that are privileged.

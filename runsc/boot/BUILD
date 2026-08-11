@@ -8,6 +8,8 @@ package(
 go_library(
     name = "boot",
     srcs = [
+        "apparmor.go",
+        "apparmor_container.go",
         "autosave.go",
         "compat.go",
         "compat_amd64.go",
@@ -85,6 +87,7 @@ go_library(
         "//pkg/sentry/fsimpl/devtmpfs",
         "//pkg/sentry/fsimpl/erofs",
         "//pkg/sentry/fsimpl/fuse",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/gofer",
         "//pkg/sentry/fsimpl/host",
         "//pkg/sentry/fsimpl/mqfs",
@@ -150,6 +153,7 @@ go_library(
         "//pkg/timing",
         "//pkg/unet",
         "//pkg/urpc",
+        "//pkg/usermem",
         "//runsc/boot/filter",
         "//runsc/boot/portforward",
         "//runsc/boot/pprof",
@@ -171,6 +175,7 @@ go_test(
     name = "boot_test",
     size = "small",
     srcs = [
+        "apparmor_test.go",
         "compat_test.go",
         "fscheckpoint_test.go",
         "loader_test.go",
@@ -179,6 +184,8 @@ go_test(
     ],
     library = ":boot",
     deps = [
+        "//pkg/sentry/confine",
+        "//pkg/sentry/fsimpl/gofer",
         "//pkg/abi/linux",
         "//pkg/control/server",
         "//pkg/cpuid",

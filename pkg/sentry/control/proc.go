@@ -128,6 +128,12 @@ type ExecArgs struct {
 	// NoNewPrivileges disallows the new process from acquiring new privileges.
 	NoNewPrivileges bool
 
+	// ConfinementProfile is the in-sandbox confinement profile the new
+	// process starts in. Empty leaves it unconfined. It is set from the
+	// container's initial process, so that a process exec'd into a
+	// container is confined exactly as the container is.
+	ConfinementProfile string
+
 	// Capabilities is the list of capabilities to give to the process.
 	Capabilities *auth.TaskCapabilities
 
@@ -210,6 +216,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		args.ExtraKGIDs,
 		args.Capabilities,
 		proc.Kernel.RootUserNamespace())
+	creds.ConfinementProfile = args.ConfinementProfile
 
 	pidns := args.PIDNamespace
 	if pidns == nil {
