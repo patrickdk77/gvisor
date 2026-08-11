@@ -141,6 +141,8 @@ go_library(
 go_test(
     name = "gofer_test",
     srcs = [
+        "revalidate_evict_test.go",
+        "revalidate_ttl_test.go",
         "gofer_test.go",
     ],
     library = ":gofer",

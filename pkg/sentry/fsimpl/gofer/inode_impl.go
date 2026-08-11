@@ -634,6 +634,32 @@ func (d *dentry) readHandleForDeleted(ctx context.Context) (handle, error) {
 	}
 }
 
+// allFresh reports whether every dentry this revalidation would stat had its
+// metadata refreshed within revalidateTTL, so that the remote filesystem need
+// not be consulted at all.
+//
+// The decision is all or nothing: the names sent to the remote filesystem form
+// a path walked from r.start, so a fresh component in the middle cannot be
+// dropped from the request without changing what the rest of it means.
+//
+// Preconditions: fs.renameMu must be locked.
+func (r *revalidateState) allFresh() bool {
+	ttl := revalidateTTL
+	if ttl == 0 {
+		return false
+	}
+	now := cacheNowNanos()
+	if r.refreshStart && now-r.start.inode.attrsAt.Load() >= ttl {
+		return false
+	}
+	for _, d := range r.dentries {
+		if now-d.inode.attrsAt.Load() >= ttl {
+			return false
+		}
+	}
+	return true
+}
+
 // doRevalidation calls into r.start's dentry implementation to perform
 // revalidation on all the dentries contained in r.
 //
@@ -644,6 +670,9 @@ func (r *revalidateState) doRevalidation(ctx context.Context, vfsObj *vfs.Virtua
 	// Skip synthetic dentries because there is no actual implementation that can
 	// be used to walk the remote filesystem. A start dentry cannot be replaced.
 	if r.start.inode.isSynthetic() {
+		return nil
+	}
+	if r.allFresh() {
 		return nil
 	}
 	switch r.start.inode.impl.(type) {
