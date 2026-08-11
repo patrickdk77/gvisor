@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -129,6 +130,11 @@ type filesystem struct {
 	// tmpfs mount will allow. It is immutable.
 	allowXattrPrefix map[string]struct{}
 
+	// mountPath is the path this filesystem is mounted at, used to build
+	// application-visible paths for AppArmor confinement checks. It is
+	// empty when the mounter did not supply one, and is immutable.
+	mountPath string
+
 	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
 	ovlWhiteout *deviceFile
 }
@@ -176,6 +182,11 @@ type FilesystemOpts struct {
 	// AllowXattrPrefix is a set of xattr namespace prefixes that this
 	// tmpfs mount will allow.
 	AllowXattrPrefix []string
+
+	// MountPath is the path this filesystem is mounted at, if known. It is
+	// used to build application-visible paths for AppArmor confinement
+	// checks, and is otherwise unused.
+	MountPath string
 
 	// SourceTar is the source tar file to be untarred into the tmpfs.
 	// Ownership is transferred to GetFilesystem, whether or not it returns an
@@ -406,6 +417,9 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
 	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
 		fs.maxFilenameLen = tmpfsOpts.MaxFilenameLen
+	}
+	if tmpfsOptsOk {
+		fs.mountPath = tmpfsOpts.MountPath
 	}
 
 	var root *dentry
@@ -788,6 +802,38 @@ func (i *inode) decRef(ctx context.Context) {
 		// Account for deletion of the inode itself
 		i.fs.unaccountInode()
 	})
+}
+
+// checkPermissions checks the inode's permissions and then the AppArmor
+// profile the accessing task has entered, if any. Callers that have a dentry
+// use this rather than inode.checkPermissions, since an inode may be reached
+// through several names and only the dentry knows the path a profile's rules
+// are matched against.
+func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if err := d.inode.checkPermissions(creds, ats); err != nil {
+		return err
+	}
+	if !creds.Confined() {
+		return nil
+	}
+	if d.inode.fs.mountPath == "" {
+		// A tmpfs the mounter did not give a path for is not reachable
+		// by one: the SysV shm mount and the files backing shared
+		// anonymous mappings are examples. There is no path for a rule
+		// to match, and fabricating one would match rules meant for
+		// unrelated files, so leave it unmediated.
+		return nil
+	}
+	// Walk to the filesystem root, collecting names.
+	var names []string
+	for cur := d; cur != nil; cur = cur.parent.Load() {
+		names = append(names, cur.name)
+	}
+	mode := linux.FileMode(d.inode.mode.Load())
+	path := confine.Path(d.inode.fs.mountPath, names,
+		mode.FileType() == linux.ModeDirectory)
+	return confine.Check(creds, path, ats, mode,
+		auth.KUID(d.inode.uid.Load()))
 }
 
 func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {

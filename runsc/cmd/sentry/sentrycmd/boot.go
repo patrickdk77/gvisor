@@ -437,6 +437,14 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 	}
 
+	// Derive in-sandbox confinement policy from the AppArmor profiles. This
+	// has to happen before the chroot below, which hides them, and before
+	// the sentry's seccomp filters are installed, which forbid opening
+	// files by path.
+	if err := boot.LoadAppArmorPolicy(conf); err != nil {
+		util.Fatalf("loading AppArmor policy: %v", err)
+	}
+
 	// The AppArmor interfaces live in /proc and /sys, which are not
 	// reachable after the chroot below, so open them now; the profile is
 	// entered at the re-exec further down.

@@ -344,6 +344,22 @@ type Config struct {
 	// Zero disables time-based eviction.
 	DCacheTTL time.Duration `flag:"dcache-ttl"`
 
+	// AppArmorPolicySource selects where AppArmor profiles are read from in
+	// order to derive in-sandbox confinement policy: "none" (the default,
+	// no in-sandbox confinement), "host" (read from the host, keeping
+	// policy under the node operator's control), or "container" (read from
+	// the container's own filesystem, so that policy versions with the
+	// image and works even on hosts without AppArmor).
+	//
+	// Note the trust difference: with "container", the workload supplies
+	// the policy that confines it.
+	AppArmorPolicySource string `flag:"apparmor-policy-source"`
+
+	// AppArmorPolicyDir is the directory the profiles are read from, in
+	// either the host's or the container's filesystem depending on
+	// AppArmorPolicySource.
+	AppArmorPolicyDir string `flag:"apparmor-policy-dir"`
+
 	// HostAppArmor applies the AppArmor profile named in the OCI spec
 	// to the sentry and gofer processes, confining the host accesses
 	// they make on the application's behalf. Profiles must be written

@@ -125,6 +125,7 @@ go_library(
         "//pkg/log",
         "//pkg/refs",
         "//pkg/sentry/arch",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",

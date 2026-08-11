@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -522,7 +523,38 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 		extraKGIDs,
 		caps,
 		userNs)
+	if conf.AppArmorPolicySource != "container" {
+		// The container source is loaded later, once the container's
+		// mount namespace exists; the profile is set then.
+		creds.ConfinementProfile = initConfinementProfile(spec)
+	}
 	return creds
+}
+
+// initConfinementProfile returns the in-sandbox confinement profile the
+// container's initial process starts in, which is the profile the spec names,
+// if the loaded policy defines it. It returns "" to leave the process
+// unconfined, which is the case when the spec names no profile, when no policy
+// was loaded, or when the profile is not one of the loaded profiles.
+//
+// Descendants inherit this profile, and may enter a different one exactly as
+// they would from an unconfined start: by exec'ing a path-named profile, or by
+// writing "changeprofile" to /proc/self/attr/current.
+func initConfinementProfile(spec *specs.Spec) string {
+	name := spec.Process.ApparmorProfile
+	if name == "" {
+		return ""
+	}
+	if !confine.HasProfile(name) {
+		// Confining the process in a profile with no rules would deny
+		// every access it makes, so leave it unconfined and say so. The
+		// profile may still be enforced on the sentry and gofer by the
+		// host, which is a separate mechanism.
+		log.Warningf("AppArmor profile %q is not enforced in-sandbox: the loaded policy does not define it", name)
+		return ""
+	}
+	log.Infof("AppArmor profile %q attached to the container's initial process", name)
+	return name
 }
 
 // New initializes a new kernel loader configured by spec.
@@ -1466,6 +1498,25 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 		}
 	}()
 
+	// The container's own policy can only be read now that its mount
+	// namespace exists, so the profile its initial process starts in is
+	// decided here rather than in getRootCredentials().
+	// A container that names no AppArmor profile has nothing to confine it,
+	// so its policy is never read. This is what the pod's pause container
+	// looks like.
+	if info.conf.AppArmorPolicySource == "container" && info.spec.Process.ApparmorProfile != "" {
+		// Policy that cannot be read leaves in-sandbox enforcement off
+		// for this container rather than failing its start: the policy
+		// comes from the image, which can ship whatever it likes
+		// anyway. The profile the spec names then goes unenforced,
+		// which initConfinementProfile() logs.
+		if err := loadContainerAppArmorPolicy(ctx, l.k.VFS(), info.procArgs.MountNamespace,
+			info.procArgs.Credentials, info.conf.AppArmorPolicyDir); err != nil {
+			log.Warningf("AppArmor: not enforced in-sandbox for this container: loading policy from it failed: %v", err)
+		}
+		info.procArgs.Credentials.ConfinementProfile = initConfinementProfile(info.spec)
+	}
+
 	// Add the HOME environment variable if it is not already set.
 	info.procArgs.Envv, err = user.MaybeAddExecUserHome(ctx, info.procArgs.MountNamespace,
 		info.procArgs.Credentials.RealKUID, info.procArgs.Envv)
@@ -1631,6 +1682,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, err
 	}
 	args.PIDNamespace = tg.PIDNamespace()
+
+	// Start in the same confinement profile as the container's initial
+	// process, so that exec'ing into a container is not a way around the
+	// profile that confines it.
+	args.ConfinementProfile = tg.Leader().Credentials().ConfinementProfile
 
 	if l.root.conf.MountCgroupV2 {
 		// Join the container's cgroup and cgroup namespace, like Linux's

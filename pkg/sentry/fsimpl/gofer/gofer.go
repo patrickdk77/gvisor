@@ -1611,7 +1611,12 @@ func (i *inode) updateSizeAndUnlockDataMuLocked(newSize uint64) {
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
-	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.inode.mode.Load()), nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load()))
+	if err := vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.inode.mode.Load()), nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load())); err != nil {
+		return err
+	}
+	// Evaluate the AppArmor profile the task has entered, if any; see
+	// confine.go.
+	return d.checkDentryConfinement(creds, ats)
 }
 
 // Preconditions: d.inode.metadataMu must be locked.

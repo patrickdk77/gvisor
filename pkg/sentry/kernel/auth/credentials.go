@@ -58,6 +58,49 @@ type Credentials struct {
 
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace
+
+	// ConfinementProfile is the name of the in-sandbox confinement profile
+	// the task has entered, or "" if the task is unconfined. It is set by
+	// writing to /proc/self/attr/current, which is what
+	// aa_change_profile(3) does, and is inherited across fork and exec
+	// like the rest of the credentials.
+	//
+	// Confinement is enforced by filesystems that have been configured for
+	// it; see the owner-confinement support in fsimpl/gofer. Note that this
+	// is not a general AppArmor implementation: the profile name selects
+	// sandbox-internal enforcement, it does not evaluate an AppArmor
+	// policy.
+	ConfinementProfile string
+}
+
+// Confined returns whether the credentials carry an in-sandbox confinement
+// profile.
+func (c *Credentials) Confined() bool {
+	return len(c.ConfinementProfile) != 0
+}
+
+// execConfinementProfiles maps an executable path to the confinement profile
+// that a task enters when it execs that path, reproducing AppArmor's
+// attachment of a profile named after an executable. It is set once during
+// sandbox startup, before any application task runs, and is read-only
+// afterwards.
+var execConfinementProfiles map[string]string
+
+// SetExecConfinementProfiles configures profiles that attach on exec of the
+// given executable paths. It must be called during sandbox startup, before
+// any application task runs.
+func SetExecConfinementProfiles(m map[string]string) {
+	execConfinementProfiles = m
+}
+
+// ExecConfinementProfile returns the confinement profile that attaches on
+// exec of path, if any.
+func ExecConfinementProfile(path string) (string, bool) {
+	if len(execConfinementProfiles) == 0 {
+		return "", false
+	}
+	name, ok := execConfinementProfiles[path]
+	return name, ok
 }
 
 // NewAnonymousCredentials returns a set of credentials with no capabilities in

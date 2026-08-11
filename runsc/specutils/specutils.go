@@ -161,12 +161,16 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
 		return fmt.Errorf("SELinux is not supported: %s", spec.Process.SelinuxLabel)
 	}
 
-	// The application's syscalls never reach the host kernel, so an
-	// AppArmor profile can only confine the sentry and gofer. It is
-	// applied only when explicitly requested; see
-	// specutils/apparmor.go.
-	if spec.Process.ApparmorProfile != "" && !conf.HostAppArmor {
-		log.Warningf("AppArmor profile %q is being ignored; pass --host-apparmor to apply it to the sentry and gofer", spec.Process.ApparmorProfile)
+	// The application's syscalls never reach the host kernel, so a host
+	// AppArmor profile can only confine the sentry and gofer, and is
+	// applied only when explicitly requested; see specutils/apparmor.go.
+	// The profile's file rules are enforced on the application itself by
+	// the sentry, which is a separate mechanism; see
+	// --apparmor-policy-source.
+	unconfined := !conf.HostAppArmor &&
+		(conf.AppArmorPolicySource == "" || conf.AppArmorPolicySource == "none")
+	if spec.Process.ApparmorProfile != "" && unconfined {
+		log.Warningf("AppArmor profile %q is being ignored; pass --host-apparmor to apply it to the sentry and gofer, or --apparmor-policy-source to enforce its file rules on the application", spec.Process.ApparmorProfile)
 	}
 
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {

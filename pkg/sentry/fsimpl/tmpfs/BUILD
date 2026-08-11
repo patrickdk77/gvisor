@@ -106,6 +106,7 @@ go_library(
     marshal = True,
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        "//pkg/sentry/confine",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
@@ -160,6 +161,7 @@ go_test(
     name = "tmpfs_test",
     size = "small",
     srcs = [
+        "confine_test.go",
         "pipe_test.go",
         "regular_file_test.go",
         "stat_test.go",

@@ -78,6 +78,7 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		"cwd":             fs.newCwdSymlink(ctx, task, fs.NextIno()),
 		"environ":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0400, &mmFile{task: task, ftype: environMMFile}),
 		"exe":             fs.newExeSymlink(ctx, task, fs.NextIno()),
+		"attr":            fs.newAttrDir(ctx, task),
 		"fd":              fs.newFDDirInode(ctx, task),
 		"fdinfo":          fs.newFDInfoDirInode(ctx, task),
 		"gid_map":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: true}),
@@ -231,6 +232,15 @@ func (fs *filesystem) newTaskOwnedInode(ctx context.Context, task *kernel.Task, 
 	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, inode, perm)
 
 	return &taskOwnedInode{Inode: inode, owner: task}
+}
+
+// newAttrDir returns /proc/[pid]/attr, through which a task enters an
+// in-sandbox confinement profile. See attrData.
+func (fs *filesystem) newAttrDir(ctx context.Context, task *kernel.Task) kernfs.Inode {
+	return fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0555, map[string]kernfs.Inode{
+		"current": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0666, &attrData{task: task}),
+		"exec":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0666, &attrData{task: task, onExec: true}),
+	})
 }
 
 func (fs *filesystem) newTaskOwnedDir(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode, children map[string]kernfs.Inode) kernfs.Inode {

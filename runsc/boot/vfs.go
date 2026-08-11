@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -407,6 +408,41 @@ func compileMounts(spec *specs.Spec, conf *config.Config, containerID string) []
 }
 
 // goferMountData creates a slice of gofer mount data.
+// appArmorPolicy is the confinement policy derived from AppArmor profiles,
+// loaded once per sandbox. Nil when --apparmor-policy-source is "none".
+var appArmorPolicy *AppArmorPolicy
+
+// LoadAppArmorPolicy reads AppArmor profiles according to
+// --apparmor-policy-source and derives the confinement policy from them. The
+// profiles are the source of truth: the paths that confine a task and the
+// executables that attach a profile both come from the profile text.
+//
+// This must be called early in sandbox startup, before the sentry chroots
+// (which hides the profiles) and before its seccomp filters are installed
+// (which forbid opening files by path).
+func LoadAppArmorPolicy(conf *config.Config) error {
+	switch conf.AppArmorPolicySource {
+	case "", "none":
+		return nil
+	case "host":
+		policy, err := LoadAppArmorPolicyDir(conf.AppArmorPolicyDir)
+		if err != nil {
+			return err
+		}
+		appArmorPolicy = policy
+	case "container":
+		// The container's filesystem is not reachable this early: its
+		// mount namespace does not exist yet. It is loaded per
+		// container by loadContainerAppArmorPolicy() instead.
+		return nil
+	default:
+		return fmt.Errorf("invalid --apparmor-policy-source %q: want none, host, or container", conf.AppArmorPolicySource)
+	}
+	auth.SetExecConfinementProfiles(appArmorPolicy.ExecAttach)
+	confine.SetPolicy(appArmorPolicy.Rules)
+	return nil
+}
+
 func goferMountData(fd int, fa config.FileAccessType, conf *config.Config, suppressDirectFS bool) []string {
 	opts := []string{
 		"trans=fd",
@@ -755,6 +791,10 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		// If a mount is being overlaid, it should not be limited by the default
 		// tmpfs size limit.
 		DisableDefaultSizeLimit: true,
+		// The upper layer is reached through the overlay, which does its
+		// own confinement checks against this path; this is set so that
+		// a direct check on the layer matches the same rules.
+		MountPath: dst,
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
@@ -849,6 +889,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	overlayOpts.GetFilesystemOptions.InternalData = overlay.FilesystemOptions{
 		UpperRoot:  upperRootVD,
 		LowerRoots: []vfs.VirtualDentry{lowerRootVD},
+		MountPath:  dst,
 	}
 	return &overlayOpts, cu.Release(), nil
 }
@@ -1090,18 +1131,20 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		if err != nil {
 			return "", nil, err
 		}
+		// MountPath is always passed, so that AppArmor rules naming a
+		// path on this mount are matched against the path the
+		// application sees. Every other option keeps its zero value.
+		tmpfsOpts := tmpfs.FilesystemOpts{MountPath: m.mount.Destination}
 		if m.filestoreFD != nil {
 			resourceID := checkpoint.ResourceID{ContainerName: containerName, Path: m.mount.Destination}
 			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), resourceID, containerID, fsr)
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to create memory file for tmpfs: %w", err)
 			}
-			tmpfsOpts := tmpfs.FilesystemOpts{
-				MemoryFile: mf,
-				// If a mount is being overlaid with tmpfs, it should not be limited by
-				// the default tmpfs size limit.
-				DisableDefaultSizeLimit: true,
-			}
+			tmpfsOpts.MemoryFile = mf
+			// If a mount is being overlaid with tmpfs, it should not be limited by
+			// the default tmpfs size limit.
+			tmpfsOpts.DisableDefaultSizeLimit = true
 			sourceTar, err := fsr.tmpfsSourceTar(resourceID, containerID)
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to get tar archive from filesystem checkpoint: %w", err)
@@ -1111,8 +1154,8 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 				tmpfsOpts.SourceTar = sourceTar
 				tmpfsOpts.SourceTarFSCheckpoint = true
 			}
-			internalData = tmpfsOpts
 		}
+		internalData = tmpfsOpts
 
 	case Bind:
 		fsName = gofer.Name
