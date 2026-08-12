@@ -42,6 +42,14 @@ doc(
 )
 
 doc(
+    name = "apparmor",
+    src = "apparmor.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/apparmor/",
+    weight = "41",
+)
+
+doc(
     name = "filesystem",
     src = "filesystem.md",
     category = "User Guide",

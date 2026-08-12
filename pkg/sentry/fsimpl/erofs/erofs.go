@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/erofs"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -330,6 +331,33 @@ func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) e
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(i.Mode()), nil, auth.KUID(i.UID()), auth.KGID(i.GID()))
 }
 
+// checkPermissions checks the inode's permissions and then the AppArmor
+// profile the accessing task has entered, if any. Callers that have a dentry
+// use this rather than inode.checkPermissions, since only the dentry knows the
+// path a profile's rules are matched against.
+func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if err := d.inode.checkPermissions(creds, ats); err != nil {
+		return err
+	}
+	if !creds.Confined() {
+		return nil
+	}
+	if d.inode.fs.iopts.UniqueID.Path == "" {
+		// Without the path the image is mounted at there is nothing for
+		// a rule to match; see the equivalent case in tmpfs.
+		return nil
+	}
+	// Walk to the filesystem root, collecting names.
+	var names []string
+	for cur := d; cur != nil; cur = cur.parent.Load() {
+		names = append(names, cur.name)
+	}
+	mode := linux.FileMode(d.inode.Mode())
+	path := confine.Path(d.inode.fs.iopts.UniqueID.Path, names,
+		mode.FileType() == linux.ModeDirectory)
+	return confine.Check(creds, path, ats, mode, auth.KUID(d.inode.UID()))
+}
+
 func (i *inode) statTo(stat *linux.Statx) {
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK |
 		linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE |
@@ -451,7 +479,7 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {}
 
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
-	if err := d.inode.checkPermissions(rp.Credentials(), ats); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
 

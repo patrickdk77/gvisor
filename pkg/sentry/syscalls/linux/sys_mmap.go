@@ -20,10 +20,13 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -123,6 +126,14 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 			}
 
 			opts.MaxPerms.Execute = false
+		}
+
+		// An executable mapping is mediated by the 'm' permission of the
+		// AppArmor profile the task has entered, if any. Without this, a
+		// task denied 'x' on a file it can write could still execute its
+		// contents by mapping them.
+		if err := checkMmapConfinement(t, file, opts.MaxPerms.Execute); err != nil {
+			return 0, nil, err
 		}
 
 		if err := file.ConfigureMMap(t, &opts); err != nil {
@@ -416,4 +427,37 @@ func traceMmap(t *kernel.Task, file *vfs.FileDescription) error {
 	return seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 		return c.Mmap(t, fields, info)
 	})
+}
+
+// checkMmapConfinement evaluates the 'm' permission of the profile the calling
+// task has entered against the file being mapped. It is a no-op for
+// unconfined tasks and for mappings that can never become executable.
+//
+// The check is done here rather than in FileDescriptionImpl.ConfigureMMap
+// because the ELF loader shares that path: requiring 'm' there would deny
+// execution of binaries a profile grants only 'ix', which host AppArmor
+// permits.
+func checkMmapConfinement(t *kernel.Task, file *vfs.FileDescription, mayExec bool) error {
+	creds := t.Credentials()
+	if !mayExec || !creds.Confined() {
+		return nil
+	}
+	root := t.MountNamespace().Root(t)
+	defer root.DecRef(t)
+	vd := file.VirtualDentry()
+	path, err := t.Kernel().VFS().PathnameWithDeleted(t, root, vd)
+	if err != nil {
+		// Without a path there is no rule to match, so deny rather than
+		// leave the mapping unmediated.
+		log.Warningf("confinement: profile %q denied m of an unreachable file: %v", creds.ConfinementProfile, err)
+		return linuxerr.EACCES
+	}
+	stat, err := file.Stat(t, vfs.StatOptions{
+		Mask: linux.STATX_MODE | linux.STATX_UID,
+	})
+	if err != nil {
+		return err
+	}
+	return confine.CheckPerms(creds, path, confine.Mmap,
+		linux.FileMode(stat.Mode), auth.KUID(stat.UID))
 }

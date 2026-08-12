@@ -274,6 +274,9 @@ func (i *lisafsInode) updateMetadataLocked(ctx context.Context, h handle) error 
 // from the remote filesystem.
 // +checklocks:i.inode.metadataMu
 func (i *lisafsInode) updateMetadataFromStatxLocked(stat *lisafs.Statx) {
+	// Record when the metadata was last known good, so that revalidation
+	// may be skipped while it is still within revalidateTTL.
+	i.attrsAt.Store(cacheNowNanos())
 	if stat.Mask&linux.STATX_TYPE != 0 {
 		if got, want := stat.Mode&linux.FileTypeMask, i.inode.fileType(); uint32(got) != want {
 			panic(fmt.Sprintf("lisafsInode file type changed from %#o to %#o", want, got))

@@ -382,6 +382,7 @@ go_library(
         "//pkg/secio",
         "//pkg/sentry/arch",
         "//pkg/sentry/checkpoint",
+        "//pkg/sentry/confine",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/fdcollector",
         "//pkg/sentry/fscheckpoint",

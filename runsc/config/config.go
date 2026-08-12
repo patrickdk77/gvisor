@@ -339,6 +339,43 @@ type Config struct {
 	// used.
 	DCache int `flag:"dcache"`
 
+	// DCacheTTL is the idle duration after which unreferenced gofer
+	// dentry cache entries are evicted, releasing their host FDs.
+	// Zero disables time-based eviction.
+	DCacheTTL time.Duration `flag:"dcache-ttl"`
+
+	// RevalidateTTL is how long cached file metadata is trusted on mounts
+	// shared with other users of the host filesystem before it is
+	// revalidated. Zero revalidates on every access.
+	RevalidateTTL time.Duration `flag:"revalidate-ttl"`
+
+	// ProcHidePid sets the hidepid= option on the container's /proc mount,
+	// which controls whether a task can see other users' processes. Empty
+	// leaves /proc as the runtime mounts it. See proc(5).
+	ProcHidePid string `flag:"proc-hidepid"`
+
+	// AppArmorPolicySource selects where AppArmor profiles are read from in
+	// order to derive in-sandbox confinement policy: "none" (the default,
+	// no in-sandbox confinement), "host" (read from the host, keeping
+	// policy under the node operator's control), or "container" (read from
+	// the container's own filesystem, so that policy versions with the
+	// image and works even on hosts without AppArmor).
+	//
+	// Note the trust difference: with "container", the workload supplies
+	// the policy that confines it.
+	AppArmorPolicySource string `flag:"apparmor-policy-source"`
+
+	// AppArmorPolicyDir is the directory the profiles are read from, in
+	// either the host's or the container's filesystem depending on
+	// AppArmorPolicySource.
+	AppArmorPolicyDir string `flag:"apparmor-policy-dir"`
+
+	// HostAppArmor applies the AppArmor profile named in the OCI spec
+	// to the sentry and gofer processes, confining the host accesses
+	// they make on the application's behalf. Profiles must be written
+	// for those processes; see runsc/specutils/apparmor.go.
+	HostAppArmor bool `flag:"host-apparmor"`
+
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`

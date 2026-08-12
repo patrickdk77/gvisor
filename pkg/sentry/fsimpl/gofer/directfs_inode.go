@@ -340,6 +340,9 @@ func (i *directfsInode) updateMetadataLocked(h handle) error {
 // from the remote filesystem.
 // +checklocks:i.inode.metadataMu
 func (i *directfsInode) updateMetadataFromStatxLocked(stat *unix.Statx_t) {
+	// Record when the metadata was last known good, so that revalidation
+	// may be skipped while it is still within revalidateTTL.
+	i.attrsAt.Store(cacheNowNanos())
 	if got, want := uint32(stat.Mode)&unix.S_IFMT, i.inode.fileType(); got != want {
 		panic(fmt.Sprintf("directfsInode file type changed from %#o to %#o", want, got))
 	}

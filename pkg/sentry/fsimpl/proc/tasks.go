@@ -125,6 +125,29 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 	return inode
 }
 
+// taskVisible returns whether the calling task may see t's directory in
+// /proc, per the hidepid= mount option. A task may always see its own thread
+// group's directories, and a task with CAP_SYS_PTRACE in the task's user
+// namespace may see all of them, as in Linux.
+func (i *tasksInode) taskVisible(ctx context.Context, t *kernel.Task) bool {
+	if i.fs.hidePid == HidePidOff {
+		return true
+	}
+	caller := kernel.TaskFromContext(ctx)
+	if caller == nil {
+		// Not an application task (an internal lookup); do not hide.
+		return true
+	}
+	if caller.ThreadGroup() == t.ThreadGroup() {
+		return true
+	}
+	callerCreds := caller.Credentials()
+	if callerCreds.HasCapabilityIn(linux.CAP_SYS_PTRACE, t.UserNamespace()) {
+		return true
+	}
+	return callerCreds.RealKUID == t.Credentials().RealKUID
+}
+
 // Lookup implements kernfs.inodeDirectory.Lookup.
 func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	// Check if a static entry was looked up.
@@ -148,6 +171,14 @@ func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, err
 
 	task := i.pidns.TaskWithID(kernel.ThreadID(tid))
 	if task == nil {
+		return nil, linuxerr.ENOENT
+	}
+	if !i.taskVisible(ctx, task) {
+		// hidepid=1 keeps the directory visible but inaccessible;
+		// hidepid=2 hides it entirely.
+		if i.fs.hidePid == HidePidNoAccess {
+			return nil, linuxerr.EACCES
+		}
 		return nil, linuxerr.ENOENT
 	}
 
@@ -208,6 +239,11 @@ func (i *tasksInode) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.Ite
 			continue
 		}
 		if leader := tg.Leader(); leader != nil {
+			// hidepid=2 hides other users' processes from listings;
+			// hidepid=1 leaves them listed but inaccessible.
+			if i.fs.hidePid == HidePidInvisible && !i.taskVisible(ctx, leader) {
+				continue
+			}
 			tids = append(tids, int(tid))
 		}
 	}

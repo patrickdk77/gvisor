@@ -130,3 +130,164 @@ func TestCgroupNoUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestSetPodResources(t *testing.T) {
+	i64p := func(v int64) *int64 { return &v }
+	u64p := func(v uint64) *uint64 { return &v }
+	defaultAnnotations := map[string]string{
+		sandboxCPUPeriodAnnotation: "100000",
+		sandboxCPUQuotaAnnotation:  "85800",
+		sandboxCPUSharesAnnotation: "684",
+		sandboxMemoryAnnotation:    "2304770048",
+	}
+	for _, tc := range []struct {
+		name        string
+		spec        *specs.Spec
+		wantUpdated bool
+		wantQuota   *int64
+		wantPeriod  *uint64
+		wantShares  *uint64
+		wantMemory  *int64
+	}{
+		{
+			name: "full",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{
+					Resources: &specs.LinuxResources{
+						CPU: &specs.LinuxCPU{Shares: u64p(2)},
+					},
+				},
+				Annotations: defaultAnnotations,
+			},
+			wantUpdated: true,
+			wantQuota:   i64p(85800),
+			wantPeriod:  u64p(100000),
+			wantShares:  u64p(684),
+			wantMemory:  i64p(2304770048),
+		},
+		{
+			name: "not-sandbox",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{},
+				Annotations: map[string]string{
+					utils.ContainerTypeAnnotation: utils.ContainerTypeContainer,
+					sandboxCPUQuotaAnnotation:     "85800",
+					sandboxCPUPeriodAnnotation:    "100000",
+				},
+			},
+			wantUpdated: false,
+		},
+		{
+			name: "nil-linux",
+			spec: &specs.Spec{
+				Annotations: defaultAnnotations,
+			},
+			wantUpdated: false,
+		},
+		{
+			name: "no-annotations",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{},
+			},
+			wantUpdated: false,
+		},
+		{
+			name: "malformed-quota-good-memory",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{},
+				Annotations: map[string]string{
+					sandboxCPUQuotaAnnotation:  "not-a-number",
+					sandboxCPUPeriodAnnotation: "100000",
+					sandboxMemoryAnnotation:    "1048576",
+				},
+			},
+			wantUpdated: true,
+			wantMemory:  i64p(1048576),
+		},
+		{
+			name: "zero-quota-unlimited",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{},
+				Annotations: map[string]string{
+					sandboxCPUQuotaAnnotation:  "0",
+					sandboxCPUPeriodAnnotation: "100000",
+				},
+			},
+			wantUpdated: false,
+		},
+		{
+			name: "negative-memory-ignored",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{},
+				Annotations: map[string]string{
+					sandboxMemoryAnnotation: "-5",
+				},
+			},
+			wantUpdated: false,
+		},
+		{
+			name: "existing-quota-preserved",
+			spec: &specs.Spec{
+				Linux: &specs.Linux{
+					Resources: &specs.LinuxResources{
+						CPU: &specs.LinuxCPU{
+							Quota:  i64p(50000),
+							Period: u64p(100000),
+							Shares: u64p(512),
+						},
+					},
+				},
+				Annotations: map[string]string{
+					sandboxCPUQuotaAnnotation:  "85800",
+					sandboxCPUPeriodAnnotation: "100000",
+					sandboxCPUSharesAnnotation: "684",
+				},
+			},
+			wantUpdated: false,
+			wantQuota:   i64p(50000),
+			wantPeriod:  u64p(100000),
+			wantShares:  u64p(512),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			updated := setPodResources(tc.spec)
+			if updated != tc.wantUpdated {
+				t.Errorf("setPodResources() = %v, want %v", updated, tc.wantUpdated)
+			}
+			var cpu *specs.LinuxCPU
+			var memory *specs.LinuxMemory
+			if tc.spec.Linux != nil && tc.spec.Linux.Resources != nil {
+				cpu = tc.spec.Linux.Resources.CPU
+				memory = tc.spec.Linux.Resources.Memory
+			}
+			checkI64 := func(field string, got, want *int64) {
+				if (got == nil) != (want == nil) {
+					t.Errorf("%s: got %v, want %v", field, got, want)
+				} else if got != nil && *got != *want {
+					t.Errorf("%s: got %d, want %d", field, *got, *want)
+				}
+			}
+			checkU64 := func(field string, got, want *uint64) {
+				if (got == nil) != (want == nil) {
+					t.Errorf("%s: got %v, want %v", field, got, want)
+				} else if got != nil && *got != *want {
+					t.Errorf("%s: got %d, want %d", field, *got, *want)
+				}
+			}
+			var gotQuota *int64
+			var gotPeriod, gotShares *uint64
+			if cpu != nil {
+				gotQuota, gotPeriod = cpu.Quota, cpu.Period
+				gotShares = cpu.Shares
+			}
+			var gotMemory *int64
+			if memory != nil {
+				gotMemory = memory.Limit
+			}
+			checkI64("cpu.quota", gotQuota, tc.wantQuota)
+			checkU64("cpu.period", gotPeriod, tc.wantPeriod)
+			checkU64("cpu.shares", gotShares, tc.wantShares)
+			checkI64("memory.limit", gotMemory, tc.wantMemory)
+		})
+	}
+}

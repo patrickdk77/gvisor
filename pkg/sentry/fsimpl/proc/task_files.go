@@ -332,6 +332,81 @@ func (d *commData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 	return int64(srclen), nil
 }
 
+// attrData implements vfs.WritableDynamicBytesSource for
+// /proc/[pid]/attr/{current,exec}.
+//
+// Writing "changeprofile <name>" to attr/current makes the task enter an
+// in-sandbox confinement profile; this is what aa_change_profile(3) writes.
+// Confinement is enforced by the Sentry, because the application's accesses
+// are serviced by the Sentry and never reach the host kernel, so a host
+// AppArmor profile cannot mediate them.
+//
+// attr/exec (aa_change_onexec(3)) is not implemented: writes fail rather
+// than silently leaving the task unconfined.
+//
+// +stateify savable
+type attrData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+
+	// onExec distinguishes attr/exec from attr/current. onExec is
+	// immutable.
+	onExec bool
+}
+
+var _ dynamicInode = (*attrData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*attrData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *attrData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if d.onExec {
+		// No profile is ever pending, since arming one is unsupported.
+		return nil
+	}
+	creds := d.task.Credentials()
+	if !creds.Confined() {
+		buf.WriteString("unconfined\n")
+		return nil
+	}
+	fmt.Fprintf(buf, "%s (enforce)\n", creds.ConfinementProfile)
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *attrData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	// A task may only write its own attributes, as in
+	// fs/proc/base.c:proc_pid_attr_write().
+	t := kernel.TaskFromContext(ctx)
+	if t == nil || t != d.task {
+		return 0, linuxerr.EACCES
+	}
+	if d.onExec {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+	srclen := src.NumBytes()
+	if srclen > hostarch.PageSize {
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]byte, srclen)
+	if _, err := src.CopyIn(ctx, buf); err != nil {
+		return 0, err
+	}
+	// The value is "<command> <argument>"; only changeprofile is
+	// supported. Trailing NUL and newline are tolerated, as libapparmor
+	// may include either.
+	cmd := strings.TrimRight(string(buf), "\x00\n")
+	const changeProfile = "changeprofile "
+	if !strings.HasPrefix(cmd, changeProfile) {
+		return 0, linuxerr.EINVAL
+	}
+	name := strings.TrimSpace(cmd[len(changeProfile):])
+	if err := t.EnterConfinementProfile(name); err != nil {
+		return 0, err
+	}
+	return srclen, nil
+}
+
 // idMapData implements vfs.WritableDynamicBytesSource for
 // /proc/[pid]/{gid_map|uid_map}.
 //

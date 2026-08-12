@@ -373,6 +373,14 @@ func SetupMounts(conf *config.Config, mounts []specs.Mount, root, procPath strin
 			// Force mount read-only if writes are not going to be sent to it.
 			flags |= unix.MS_RDONLY
 		}
+		rro := specutils.IsRROMount(m.Options)
+		if rro {
+			// Recursively read-only: make the top level read-only
+			// here; the deferred flag application below extends
+			// it to the whole subtree with
+			// mount_setattr(AT_RECURSIVE).
+			flags |= unix.MS_RDONLY
+		}
 
 		log.Infof("Mounting src: %q, dst: %q, flags: %#x, idMapped: %t", m.Source, dst, flags, specutils.IsIDMappedMount(m))
 		src := m.Source
@@ -410,7 +418,7 @@ func SetupMounts(conf *config.Config, mounts []specs.Mount, root, procPath strin
 		defer unix.Close(dstFD)
 		// Apply mount options after creating all mount points.
 		// Otherwise they can be remounted into read-only.
-		defer func(dstFD int, flags uint32, dst string, isIDMapped bool) {
+		defer func(dstFD int, flags uint32, dst string, isIDMapped, rro bool) {
 			path := fmt.Sprintf("/proc/self/fd/%d", dstFD)
 			// The gofer process doesn't execute anything natively.
 			flags |= unix.MS_NOSUID
@@ -463,7 +471,19 @@ func SetupMounts(conf *config.Config, mounts []specs.Mount, root, procPath strin
 					return
 				}
 			}
-		}(dstFD, flags, dst, specutils.IsIDMappedMount(m))
+
+			if rro {
+				// Extend read-only to every mount in the
+				// subtree, matching runc's handling of the
+				// "rro" option (requires Linux 5.12+).
+				attr := &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+				if err := unix.MountSetattr(dstFD, "",
+					unix.AT_EMPTY_PATH|unix.AT_RECURSIVE, attr); err != nil {
+					retErr = fmt.Errorf("mount_setattr rro dst: %q, err: %w", dst, err)
+					return
+				}
+			}
+		}(dstFD, flags, dst, specutils.IsIDMappedMount(m), rro)
 
 		// Set propagation options that cannot be set together with other options.
 		flags = specutils.PropOptionsToFlags(m.Options)

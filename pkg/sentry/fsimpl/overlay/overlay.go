@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -86,6 +87,11 @@ type FilesystemOptions struct {
 	// LowerRoots contains the roots of the immutable lower layers of the
 	// overlay. LowerRoots is immutable.
 	LowerRoots []vfs.VirtualDentry
+
+	// MountPath is the path this overlay is mounted at, if known. It is used
+	// to build application-visible paths for confinement checks, and is
+	// otherwise unused. MountPath is immutable.
+	MountPath string
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -884,7 +890,29 @@ func (d *dentry) topLookupLayer() lookupLayer {
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
-	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
+	if err := vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
+		return err
+	}
+	return d.checkConfinement(creds, ats)
+}
+
+// checkConfinement evaluates the AppArmor profile the accessing task has
+// entered, if any. The rootfs is usually an overlay, so without this the
+// profile would not cover the container's own files, including any setuid
+// binary in the image. See pkg/sentry/confine.
+func (d *dentry) checkConfinement(creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if !creds.Confined() {
+		return nil
+	}
+	// Walk to the filesystem root, collecting names.
+	var names []string
+	for cur := d; cur != nil; cur = cur.parent.Load() {
+		names = append(names, cur.name)
+	}
+	mode := linux.FileMode(d.mode.Load())
+	path := confine.Path(d.fs.opts.MountPath, names,
+		mode.FileType() == linux.ModeDirectory)
+	return confine.Check(creds, path, ats, mode, auth.KUID(d.uid.Load()))
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {

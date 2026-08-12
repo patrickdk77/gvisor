@@ -127,6 +127,11 @@ type Boot struct {
 	// to the process.
 	applyCaps bool
 
+	// hostAppArmor mirrors Config.HostAppArmor, so that willReexec() can
+	// account for the re-exec that entering an AppArmor profile requires.
+	// It is set at the start of Execute.
+	hostAppArmor bool
+
 	// setUpChroot is set to true if the sandbox is started in an empty root.
 	setUpRoot bool
 
@@ -318,6 +323,11 @@ func (b *Boot) willReexec() bool {
 	if b.syncUsernsFD >= 0 {
 		return true // Rootless mode.
 	}
+	if b.hostAppArmor {
+		// An AppArmor profile is entered at exec; see
+		// specutils/apparmor.go.
+		return true
+	}
 	return false
 }
 
@@ -330,6 +340,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	conf := args[0].(*config.Config)
+	b.hostAppArmor = conf.HostAppArmor
 
 	if hostPageSize := unix.Getpagesize(); hostPageSize != hostarch.PageSize {
 		util.Fatalf("host page size (%d) does not match compiled page size (%d)", hostPageSize, hostarch.PageSize)
@@ -402,6 +413,13 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		util.Fatalf("reading spec: %v", err)
 	}
 
+	// Entering an AppArmor profile requires an exec, so willReexec() must
+	// account for it. Only force one when there is actually a profile to
+	// enter: the sandbox's own spec often has none (the pause container in
+	// Kubernetes, or `runsc do`), and re-execing for nothing breaks
+	// sandbox startup.
+	b.hostAppArmor = conf.HostAppArmor && spec.Process.ApparmorProfile != ""
+
 	if specutils.NVProxyEnabled(spec, conf) && b.procDriverNvidiaParams == "" {
 		driverCaps, driverCapsErr := specutils.NVProxyDriverCapsAllowed(conf)
 		nvhs, err := nvconf.GetHostSettings(nvconf.HostSettingsOptions{
@@ -416,6 +434,34 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 				b.nvidiaFabricIMEXManagementDevMinor = int64(nvhs.FabricIMEXManagementDevMinor)
 				argOverride["nvidia-fabric-imex-mgmt-minor"] = strconv.FormatUint(uint64(nvhs.FabricIMEXManagementDevMinor), 10)
 			}
+		}
+	}
+
+	// Derive in-sandbox confinement policy from the AppArmor profiles. This
+	// has to happen before the chroot below, which hides them, and before
+	// the sentry's seccomp filters are installed, which forbid opening
+	// files by path.
+	if err := boot.LoadAppArmorPolicy(conf); err != nil {
+		util.Fatalf("loading AppArmor policy: %v", err)
+	}
+
+	// The AppArmor interfaces live in /proc and /sys, which are not
+	// reachable after the chroot below, so open them now; the profile is
+	// entered at the re-exec further down.
+	var aaProfile *specutils.AppArmorProfile
+	if conf.HostAppArmor && spec.Process.ApparmorProfile != "" {
+		switch {
+		case !b.applyCaps:
+			// This is the re-exec'd sentry: it is already running under
+			// the profile. Log the label while /proc is still reachable.
+			specutils.LogAppArmorLabel("sentry")
+		case b.willReexec():
+			var err error
+			if aaProfile, err = specutils.PrepareAppArmorProfile(spec.Process.ApparmorProfile); err != nil {
+				util.Fatalf("sentry: %v", err)
+			}
+		default:
+			util.Fatalf("sentry: cannot apply AppArmor profile %q: entering a profile requires an exec, but this sentry will not re-exec", spec.Process.ApparmorProfile)
 		}
 	}
 
@@ -523,6 +569,13 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 			// Remove the args that have already been done before calling self.
 			args := sandboxsetup.PrepareArgs(b.Name(), f, argOverride)
+
+			// Enter the AppArmor profile at this exec. This locks the
+			// goroutine to its thread, which is required because the
+			// pending profile is per-task.
+			if err := aaProfile.SetOnExec(); err != nil {
+				util.Fatalf("sentry: %v", err)
+			}
 
 			// Note that we've already read the spec from the spec FD, and
 			// we will read it again after the exec call. This works
@@ -733,6 +786,11 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 	// Closes startSyncFile because 'l.Run()' only returns when the sandbox exits.
 	startSyncFile.Close()
+
+	// Confine the sentry for the rest of its lifetime. This happens
+	// after sandbox setup and before the application runs, so the
+	// profile only needs to permit what the sentry does while serving
+	// the application.
 
 	// Wait for the start signal from runsc.
 	l.WaitForStartSignal()

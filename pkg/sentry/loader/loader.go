@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -320,11 +321,25 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
+	// A profile named after an executable attaches when that executable is
+	// exec'd, as AppArmor does for profiles whose name is a path. Note that
+	// confinement is one-way: an already-confined task keeps its profile.
+	execPath := file.MappedName(ctx)
+	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, execPath,
 		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
 	}
+	// The profile a task runs under after exec is decided by the exec rules
+	// of the profile it is in: a path-named profile attaches, "ix" inherits,
+	// "px" enters a named profile, "ux" runs unconfined. An unconfined task
+	// enters the profile named after the executable, if there is one.
+	// c is already a private copy; see auth.ComputeCredsForExec().
+	newProfile, err := confine.TransitionOnExec(c.ConfinementProfile, execPath)
+	if err != nil {
+		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to enter an AppArmor profile for %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
+	}
+	c.ConfinementProfile = newProfile
 	secureExecInt := 0
 	if secureExec {
 		secureExecInt = 1

@@ -75,6 +75,7 @@ var (
 		"thread-self": threadSelfLink.NextOff,
 	}
 	taskStaticFiles = map[string]testutil.DirentType{
+		"attr":            linux.DT_DIR,
 		"auxv":            linux.DT_REG,
 		"cgroup":          linux.DT_REG,
 		"cwd":             linux.DT_LNK,

@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -72,6 +73,15 @@ const (
 	configFile = "config.toml"
 
 	cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
+
+	// Pod-level resource limits are attached to the pod sandbox by
+	// containerd's CRI plugin as annotations only; the sandbox OCI
+	// spec itself carries just the default cpu shares. See
+	// https://gvisor.dev/issue/13777.
+	sandboxCPUPeriodAnnotation = "io.kubernetes.cri.sandbox-cpu-period"
+	sandboxCPUQuotaAnnotation  = "io.kubernetes.cri.sandbox-cpu-quota"
+	sandboxCPUSharesAnnotation = "io.kubernetes.cri.sandbox-cpu-shares"
+	sandboxMemoryAnnotation    = "io.kubernetes.cri.sandbox-memory"
 )
 
 type oomPoller interface {
@@ -701,6 +711,7 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 		return nil, fmt.Errorf("update volume annotations: %w", err)
 	}
 	updated = setPodCgroup(spec) || updated
+	updated = setPodResources(spec) || updated
 
 	if updated {
 		if err := utils.WriteSpec(r.Bundle, spec); err != nil {
@@ -764,6 +775,87 @@ func setPodCgroup(spec *specs.Spec) bool {
 		}
 	}
 	return false
+}
+
+// annotationIntValue returns the value of the given annotation
+// parsed as a base-10 integer, or false if the annotation is absent
+// or malformed.
+func annotationIntValue(spec *specs.Spec, key string) (int64, bool) {
+	v, ok := spec.Annotations[key]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.L.Warningf("ignoring malformed annotation %s=%q: %v", key, v, err)
+		return 0, false
+	}
+	return n, true
+}
+
+// setPodResources copies pod-level resource limits from the CRI
+// sandbox annotations into the sandbox spec's resources. All of a
+// pod's containers run inside the sandbox process, so the sandbox
+// cgroup is the only host cgroup where pod-wide limits can be
+// enforced; containerd populates per-container specs but leaves the
+// sandbox spec with the default cpu shares, recording pod-level
+// limits as annotations only (see https://gvisor.dev/issue/13777).
+// Limits already present in the spec are left untouched. Returns
+// true if the spec was modified.
+func setPodResources(spec *specs.Spec) bool {
+	if !utils.IsSandbox(spec) || spec.Linux == nil {
+		return false
+	}
+	updated := false
+	ensure := func() *specs.LinuxResources {
+		if spec.Linux.Resources == nil {
+			spec.Linux.Resources = &specs.LinuxResources{}
+		}
+		return spec.Linux.Resources
+	}
+
+	quota, qok := annotationIntValue(spec, sandboxCPUQuotaAnnotation)
+	period, pok := annotationIntValue(spec, sandboxCPUPeriodAnnotation)
+	if qok && pok && quota > 0 && period > 0 {
+		res := ensure()
+		if res.CPU == nil {
+			res.CPU = &specs.LinuxCPU{}
+		}
+		if res.CPU.Quota == nil || *res.CPU.Quota == 0 {
+			p := uint64(period)
+			res.CPU.Quota = &quota
+			res.CPU.Period = &p
+			updated = true
+		}
+	}
+
+	shares, sok := annotationIntValue(spec, sandboxCPUSharesAnnotation)
+	if sok && shares > 0 {
+		res := ensure()
+		if res.CPU == nil {
+			res.CPU = &specs.LinuxCPU{}
+		}
+		// The sandbox spec carries the minimum shares value (2)
+		// by default; treat it as unset.
+		if res.CPU.Shares == nil || *res.CPU.Shares <= 2 {
+			s := uint64(shares)
+			res.CPU.Shares = &s
+			updated = true
+		}
+	}
+
+	mem, mok := annotationIntValue(spec, sandboxMemoryAnnotation)
+	if mok && mem > 0 {
+		res := ensure()
+		if res.Memory == nil {
+			res.Memory = &specs.LinuxMemory{}
+		}
+		if res.Memory.Limit == nil || *res.Memory.Limit == 0 {
+			res.Memory.Limit = &mem
+			updated = true
+		}
+	}
+	return updated
 }
 
 // GvisorTaskServer adapters runscService to taskServer.GvisorTaskServiceExt.
@@ -927,7 +1019,19 @@ func setDebug(r *runsccmd.Runsc, d *pb.Debug) *runsccmd.Runsc {
 	if r == nil {
 		return nil
 	}
-	cp := *r
+	// Copy the client configuration explicitly rather than copying
+	// the struct: Runsc contains a mutex and a cached direct-stats
+	// client that must not be shared between instances.
+	cp := runsccmd.Runsc{
+		Command:      r.Command,
+		PdeathSignal: r.PdeathSignal,
+		Setpgid:      r.Setpgid,
+		Root:         r.Root,
+		Log:          r.Log,
+		LogFormat:    r.LogFormat,
+		PanicLog:     r.PanicLog,
+		Config:       r.Config,
+	}
 	if d == nil {
 		cp.Debug = false
 		cp.DebugLog = ""

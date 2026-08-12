@@ -483,6 +483,9 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 	newPk.tuple = pk.tuple
 	newPk.Mark = pk.Mark
 	newPk.InputNICID = pk.InputNICID
+	newPk.GSOOptions = pk.GSOOptions
+	newPk.RXChecksumValidated = pk.RXChecksumValidated
+	newPk.Hash = pk.Hash
 
 	return newPk
 }
@@ -1081,7 +1084,6 @@ func UpdateHeaders(n header.Network, t header.Transport, updateSRCFields, fullCh
 
 // CalculateTransportChecksum calculates the transport-layer checksum of the
 // packet.
-// TODO: b/521901282 - Verify with GSO.
 func (pk *PacketBuffer) CalculateTransportChecksum() {
 	netHdr, transHdr, isICMPError, ok := pk.GetHeaders()
 	if isICMPError {
@@ -1100,6 +1102,16 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		}
 		netHdr = pk.Network()
 		transProto := netHdr.TransportProtocol()
+		if pk.NetworkProtocolNumber == header.IPv6ProtocolNumber {
+			ipv6Hdr, ok := netHdr.(header.IPv6)
+			if !ok {
+				return
+			}
+			transProto, ok = ipv6Hdr.TryParseTransportProtocol()
+			if !ok {
+				return
+			}
+		}
 
 		var headerSize int
 		switch transProto {
@@ -1133,6 +1145,12 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		}
 	}
 
+	gso := &pk.GSOOptions
+	needsOnlyPartialCsum := gso.Type != GSONone && gso.NeedsCsum
+	if needsOnlyPartialCsum {
+		return
+	}
+
 	var xsum uint16
 	switch t := transHdr.(type) {
 	case header.TCP:
@@ -1141,9 +1159,11 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		proto := netHdr.TransportProtocol()
 		totalLen := uint16(len(t) + pk.Data().Size())
 		xsum = header.PseudoHeaderChecksum(proto, src, dst, totalLen)
-		xsum = checksum.Combine(xsum, pk.Data().Checksum())
 		t.SetChecksum(0)
+
+		xsum = checksum.Combine(xsum, pk.Data().Checksum())
 		t.SetChecksum(^t.CalculateChecksum(xsum))
+
 	case header.UDP:
 		src := netHdr.SourceAddress()
 		dst := netHdr.DestinationAddress()

@@ -68,6 +68,7 @@ go_library(
     name = "gofer",
     srcs = [
         "dentry_list.go",
+        "confine.go",
         "directfs_inode.go",
         "directory.go",
         "filesystem.go",
@@ -111,6 +112,7 @@ go_library(
         "//pkg/safemem",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/fsimpl/host",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
         "//pkg/sentry/fsutil",
@@ -138,7 +140,11 @@ go_library(
 
 go_test(
     name = "gofer_test",
-    srcs = ["gofer_test.go"],
+    srcs = [
+        "revalidate_evict_test.go",
+        "revalidate_ttl_test.go",
+        "gofer_test.go",
+    ],
     library = ":gofer",
     deps = [
         "//pkg/abi/linux",
