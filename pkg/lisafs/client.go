@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -53,6 +54,19 @@ type Client struct {
 	// watchdogWg only holds the watchdog goroutine.
 	watchdogWg sync.WaitGroup
 
+	// shutdownEv wakes the watchdog when the client is closed. Close() used
+	// to rely solely on shutting the main socket down and the watchdog seeing
+	// a hangup, which does not happen if the socket's descriptor has been
+	// closed or replaced: Socket.Shutdown() then fails with ENOTSOCK, the
+	// poll never reports POLLHUP, the watchdog never returns, and Close()
+	// waits on it forever. A sandbox in that state cannot tear down, which
+	// presents as a container that will not die. shutdownEv makes the wakeup
+	// independent of the socket's state.
+	shutdownEv eventfd.Eventfd
+
+	// closeOnce makes Close() idempotent.
+	closeOnce sync.Once
+
 	// supported caches information about which messages are supported. It is
 	// indexed by MID. An MID is supported if supported[MID] is true.
 	supported []bool
@@ -78,6 +92,12 @@ func NewClient(sock *unet.Socket) (*Client, Inode, int, error) {
 		maxMessageSize: 1 << 20, // 1 MB for now.
 		fdsToClose:     make([]FDID, 0, fdsToCloseBatchSize),
 	}
+	shutdownEv, err := eventfd.Create()
+	if err != nil {
+		sock.Close()
+		return nil, Inode{}, -1, fmt.Errorf("creating the client's shutdown eventfd: %w", err)
+	}
+	c.shutdownEv = shutdownEv
 
 	// Start a goroutine to check socket health. This goroutine is also
 	// responsible for client cleanup.
@@ -160,6 +180,13 @@ func (c *Client) watchdog() {
 			Fd:     int32(c.sockComm.FD()),
 			Events: unix.POLLHUP | unix.POLLRDHUP,
 		},
+		{
+			// Close() writes here, so that a socket which never
+			// reports a hangup cannot keep this goroutine, and
+			// therefore Close(), waiting forever.
+			Fd:     int32(c.shutdownEv.FD()),
+			Events: unix.POLLIN,
+		},
 	}
 
 	// Wait for a shutdown event.
@@ -170,8 +197,8 @@ func (c *Client) watchdog() {
 		}
 		if err != nil {
 			log.Warningf("lisafs.Client.watch(): %v", err)
-		} else if n != 1 {
-			log.Warningf("lisafs.Client.watch(): got %d events, wanted 1", n)
+		} else if n < 1 {
+			log.Warningf("lisafs.Client.watch(): got %d events, wanted at least 1", n)
 		}
 		break
 	}
@@ -211,12 +238,26 @@ func (c *Client) shutdownActiveChans() {
 	c.availableChannels = nil
 }
 
-// Close shuts down the main socket and waits for the watchdog to clean up.
+// Close shuts down the main socket and waits for the watchdog to clean up. It
+// is idempotent: it closes a descriptor, whose number is free to be reused as
+// soon as it is closed, so a second call must not touch it again.
 func (c *Client) Close() {
-	// This shutdown has no effect if the watchdog has already fired and closed
-	// the main socket.
-	c.sockComm.shutdown()
-	c.watchdogWg.Wait()
+	c.closeOnce.Do(func() {
+		// This shutdown has no effect if the watchdog has already fired and
+		// closed the main socket.
+		c.sockComm.shutdown()
+		// Wake the watchdog explicitly. Shutting the socket down is not
+		// enough on its own: if its descriptor is no longer a socket,
+		// Shutdown() fails and no hangup is ever reported, and the Wait()
+		// below would never return.
+		if err := c.shutdownEv.Notify(); err != nil {
+			log.Warningf("lisafs.Client.Close(): notifying the watchdog: %v", err)
+		}
+		c.watchdogWg.Wait()
+		if err := c.shutdownEv.Close(); err != nil {
+			log.Warningf("lisafs.Client.Close(): closing the shutdown eventfd: %v", err)
+		}
+	})
 }
 
 func (c *Client) createChannel() (*channel, error) {

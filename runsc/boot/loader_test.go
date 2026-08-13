@@ -348,14 +348,19 @@ type CreateMountTestcase struct {
 	expectedPaths []string
 }
 
-func createMountTestcases() []*CreateMountTestcase {
+func createMountTestcases(t *testing.T) []*CreateMountTestcase {
+	// Each case gets a private root. Using os.TempDir() meant the mount
+	// points the cases create ("/proc", "/sys", ...) survived the test and
+	// collided with the next run, or with a concurrent one, as "file
+	// exists".
+	tmpDir := t.TempDir()
 	testCases := []*CreateMountTestcase{
 		{
 			// Only proc.
 			name: "only proc mount",
 			spec: specs.Spec{
 				Root: &specs.Root{
-					Path:     os.TempDir(),
+					Path:     tmpDir,
 					Readonly: true,
 				},
 				Mounts: []specs.Mount{
@@ -374,7 +379,7 @@ func createMountTestcases() []*CreateMountTestcase {
 			name: "deep mount path",
 			spec: specs.Spec{
 				Root: &specs.Root{
-					Path:     os.TempDir(),
+					Path:     tmpDir,
 					Readonly: true,
 				},
 				Mounts: []specs.Mount{
@@ -396,7 +401,7 @@ func createMountTestcases() []*CreateMountTestcase {
 			name: "nested mounts",
 			spec: specs.Spec{
 				Root: &specs.Root{
-					Path:     os.TempDir(),
+					Path:     tmpDir,
 					Readonly: true,
 				},
 				Mounts: []specs.Mount{
@@ -439,7 +444,7 @@ func createMountTestcases() []*CreateMountTestcase {
 			name: "mount inside /dev",
 			spec: specs.Spec{
 				Root: &specs.Root{
-					Path:     os.TempDir(),
+					Path:     tmpDir,
 					Readonly: true,
 				},
 				Mounts: []specs.Mount{
@@ -477,7 +482,7 @@ func createMountTestcases() []*CreateMountTestcase {
 			name: "mounts inside mandatory mounts",
 			spec: specs.Spec{
 				Root: &specs.Root{
-					Path:     os.TempDir(),
+					Path:     tmpDir,
 					Readonly: true,
 				},
 				Mounts: []specs.Mount{
@@ -508,7 +513,7 @@ func createMountTestcases() []*CreateMountTestcase {
 
 // Test that MountNamespace can be created with various specs.
 func TestCreateMountNamespace(t *testing.T) {
-	for _, tc := range createMountTestcases() {
+	for _, tc := range createMountTestcases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := testSpec()
 			spec.Mounts = tc.spec.Mounts
@@ -606,7 +611,10 @@ func TestCreateMountPoint(t *testing.T) {
 
 	spec := testSpec()
 	spec.Root = &specs.Root{
-		Path: os.TempDir(),
+		// A private root, for the same reason as in
+		// createMountTestcases: mount points created here would
+		// otherwise persist in the shared temporary directory.
+		Path: t.TempDir(),
 	}
 	spec.Mounts = append(spec.Mounts, specs.Mount{
 		Destination: "/test",
