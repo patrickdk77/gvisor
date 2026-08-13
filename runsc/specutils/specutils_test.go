@@ -16,6 +16,7 @@ package specutils
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -839,5 +840,56 @@ func TestTPUProxyEnabled(t *testing.T) {
 				t.Errorf("TPUProxyEnabled() got: %v, want: %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReadMountsEmpty covers the message a container start fails with when the
+// gofer dies before publishing its mount list.
+//
+// The list arrives over a pipe whose only writers are the gofer and its
+// children, so a clean end of file with nothing in it means the gofer exited
+// first. That was reported as "error unmarshaling mounts: unexpected end of
+// JSON input" followed by an empty dump of the bytes, which blames the reader
+// for the writer's death and sends whoever is debugging it looking for corrupt
+// JSON that does not exist.
+func TestReadMountsEmpty(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	// Closing the write end with nothing written is the gofer exiting early.
+	w.Close()
+
+	_, err = ReadMounts(r)
+	if err == nil {
+		t.Fatal("ReadMounts of an empty pipe succeeded, want an error")
+	}
+	if strings.Contains(err.Error(), "unmarshal") || strings.Contains(err.Error(), "JSON") {
+		t.Errorf("ReadMounts error = %q; an empty pipe is the gofer exiting early, not malformed JSON", err)
+	}
+	if !strings.Contains(err.Error(), "gofer") {
+		t.Errorf("ReadMounts error = %q, want it to name the gofer as the cause", err)
+	}
+}
+
+// TestReadMountsValid verifies the normal path still parses.
+func TestReadMountsValid(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	go func() {
+		w.WriteString(`[{"destination":"/tmp","type":"tmpfs"}]`)
+		w.Close()
+	}()
+
+	mounts, err := ReadMounts(r)
+	if err != nil {
+		t.Fatalf("ReadMounts: %v", err)
+	}
+	if len(mounts) != 1 || mounts[0].Destination != "/tmp" {
+		t.Errorf("mounts = %+v, want one mount at /tmp", mounts)
 	}
 }
