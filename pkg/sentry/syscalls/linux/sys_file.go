@@ -1505,7 +1505,7 @@ func Fchmodat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		// filesystem, so specifying it will result in an EOPNOTSUPP
 		// error". Report it here: the Sentry's own filesystems would
 		// otherwise accept the change and record a mode nothing reads.
-		tpop, err := getTaskPathOperation(t, dirfd, path, emptyPath, follow)
+		tpop, err := getTaskPathOperation(t, dirfd, path, emptyPath, follow, 0)
 		if err != nil {
 			return 0, nil, err
 		}

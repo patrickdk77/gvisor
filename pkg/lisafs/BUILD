@@ -111,6 +111,7 @@ go_library(
         "//pkg/flipcall",
         "//pkg/fspath",
         "//pkg/hostarch",
+        "//pkg/eventfd",
         "//pkg/log",
         "//pkg/marshal/primitive",
         "//pkg/p9",
