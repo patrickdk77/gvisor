@@ -555,6 +555,10 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, ct 
 	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
+	// Creating name is mediated by a rule for name's own path.
+	if err := parent.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+		return err
+	}
 	// Ensure that the parent directory is copied-up so that we can create the
 	// new file in the upper layer.
 	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, ct == createSyntheticMountpoint); err != nil {
@@ -1119,6 +1123,13 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	oldParent := oldParentVD.Dentry().Impl().(*dentry)
 	creds := rp.Credentials()
 	if err := oldParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+		return err
+	}
+	// Renaming is mediated by rules for the two paths involved.
+	if err := oldParent.checkChildConfinement(creds, oldName, vfs.MayWrite); err != nil {
+		return err
+	}
+	if err := newParent.checkChildConfinement(creds, newName, vfs.MayWrite); err != nil {
 		return err
 	}
 	// We need a dentry representing the renamed file since, if it's a

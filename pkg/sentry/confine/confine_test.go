@@ -67,9 +67,9 @@ func TestParsePerms(t *testing.T) {
 		want Perm
 	}{
 		{"r", Read},
-		// AppArmor's 'w' grants appending as well.
-		{"rw", Read | Write | Append},
-		{"rwkmlix", Read | Write | Append | Lock | Mmap | Link | Exec},
+		// 'w' conflicts with append mode rather than including it.
+		{"rw", Read | Write},
+		{"rwkmlix", Read | Write | Lock | Mmap | Link | Exec},
 		{"ix", Exec},
 		{"rk", Read | Lock},
 		{"a", Append},
@@ -349,14 +349,49 @@ func TestCheckPermsMmap(t *testing.T) {
 	}
 }
 
-// TestParsePermsWriteImpliesAppend checks AppArmor's rule that 'w' grants
-// appending, so that a rule written "w" covers an O_APPEND write.
-func TestParsePermsWriteImpliesAppend(t *testing.T) {
-	if p := ParsePerms("w"); p&Append == 0 {
-		t.Errorf(`ParsePerms("w") = %v, want Append set`, p)
+// TestWriteAndAppendConflict covers apparmor.d(5): write mode "conflicts with
+// append mode", so neither letter implies the other. An O_APPEND write is
+// permitted by either, which CheckAppendWrite() decides.
+func TestWriteAndAppendConflict(t *testing.T) {
+	if p := ParsePerms("w"); p&Append != 0 {
+		t.Errorf(`ParsePerms("w") = %v, want Append clear`, p)
 	}
 	if p := ParsePerms("a"); p&Write != 0 {
 		t.Errorf(`ParsePerms("a") = %v, want Write clear`, p)
+	}
+
+	SetPolicy(map[string]*Profile{
+		"w": {Name: "w", Rules: []Rule{{Pattern: "/log", Perms: ParsePerms("w")}}},
+		"a": {Name: "a", Rules: []Rule{{Pattern: "/log", Perms: ParsePerms("a")}}},
+		"r": {Name: "r", Rules: []Rule{{Pattern: "/log", Perms: ParsePerms("r")}}},
+	})
+	defer SetPolicy(nil)
+	const mode = linux.FileMode(0644)
+	for _, tc := range []struct {
+		profile   string
+		append    bool
+		wantAllow bool
+	}{
+		// A plain write needs 'w'.
+		{profile: "w", wantAllow: true},
+		{profile: "a", wantAllow: false},
+		{profile: "r", wantAllow: false},
+		// An O_APPEND write is allowed by either.
+		{profile: "w", append: true, wantAllow: true},
+		{profile: "a", append: true, wantAllow: true},
+		{profile: "r", append: true, wantAllow: false},
+	} {
+		creds := auth.NewAnonymousCredentials()
+		creds.ConfinementProfile = tc.profile
+		var err error
+		if tc.append {
+			err = CheckAppendWrite(creds, "/log", mode, auth.KUID(0))
+		} else {
+			err = Check(creds, "/log", vfs.MayWrite, mode, auth.KUID(0))
+		}
+		if gotAllow := err == nil; gotAllow != tc.wantAllow {
+			t.Errorf("profile %q append=%t: allowed=%t, want %t", tc.profile, tc.append, gotAllow, tc.wantAllow)
+		}
 	}
 }
 
@@ -530,7 +565,7 @@ func TestTransitionOnExec(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := TransitionOnExec(tc.from, tc.path)
+			got, _, err := TransitionOnExec(tc.from, tc.path)
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("TransitionOnExec(%q, %q) error = %v, wantErr %t", tc.from, tc.path, err, tc.wantErr)
 			}
@@ -557,12 +592,133 @@ func TestTransitionMostSpecificRuleWins(t *testing.T) {
 		"/bin/other": "",
 		"/usr/thing": "p",
 	} {
-		got, err := TransitionOnExec("p", path)
+		got, _, err := TransitionOnExec("p", path)
 		if err != nil {
 			t.Fatalf("TransitionOnExec(%q) = %v", path, err)
 		}
 		if got != want {
 			t.Errorf("TransitionOnExec(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// TestCreateMediatedByFilePath covers what AppArmor mediates when a file is
+// created: a rule for the file's own path, not a write rule on the directory
+// holding it. A profile that grants "owner /var/www/vhosts/sessions/?/?/*
+// rwk" and only "r" on the directories above it must be able to create a
+// session file, which is what PHP does.
+func TestCreateMediatedByFilePath(t *testing.T) {
+	SetPolicy(map[string]*Profile{
+		"cageweb": {Name: "cageweb", Rules: []Rule{
+			{Pattern: "/var/www/vhosts/sessions/", Perms: ParsePerms("r")},
+			{Pattern: "/var/www/vhosts/sessions/?/", Perms: ParsePerms("r")},
+			{Pattern: "/var/www/vhosts/sessions/?/?/", Perms: ParsePerms("r")},
+			{Pattern: "/var/www/vhosts/sessions/?/?/*", Perms: ParsePerms("rwk"), Owner: true},
+		}},
+	})
+	defer SetPolicy(nil)
+
+	creds := auth.NewAnonymousCredentials()
+	creds.EffectiveKUID = 1000
+	creds.ConfinementProfile = "cageweb"
+	const sess = "/var/www/vhosts/sessions/q/4/sess_q453ond5ff7v6celijpb8duab8b5e0vf"
+
+	// Writing the session file is permitted: the owner rule covers it. A file
+	// being created has no mode yet, which must not make the check fail.
+	if err := Check(creds, sess, vfs.MayWrite, linux.FileMode(0), auth.KUID(1000)); err != nil {
+		t.Errorf("Check(%q, MayWrite) = %v, want nil", sess, err)
+	}
+	if err := Check(creds, sess, vfs.MayRead|vfs.MayWrite, linux.FileMode(0644), auth.KUID(1000)); err != nil {
+		t.Errorf("Check(%q, MayRead|MayWrite) = %v, want nil", sess, err)
+	}
+	// A directory's write permission is not mediated at all: the kernel
+	// requires it to create an entry, but AppArmor has no equivalent, so
+	// requiring it here denied writes the profile allows.
+	dir := "/var/www/vhosts/sessions/q/4/"
+	if err := Check(creds, dir, vfs.MayWrite, linux.FileMode(linux.ModeDirectory|0777), auth.KUID(0)); err != nil {
+		t.Errorf("Check(%q, MayWrite) = %v, want nil: a directory's write bit is not mediated", dir, err)
+	}
+	// Reading it is mediated, and the profile grants that.
+	if err := Check(creds, dir, vfs.MayRead, linux.FileMode(linux.ModeDirectory|0777), auth.KUID(0)); err != nil {
+		t.Errorf("Check(%q, MayRead) = %v, want nil", dir, err)
+	}
+	// Another user's session file is still denied by the owner rule.
+	if err := Check(creds, sess, vfs.MayRead, linux.FileMode(0600), auth.KUID(1001)); err == nil {
+		t.Error("reading another user's session file was permitted")
+	}
+}
+
+// TestMmapReadOnlyNeedsNoM records that a read-only mapping is not mediated by
+// 'm'. AppArmor's 'm' covers PROT_EXEC; gating on what a mapping could become
+// through mprotect(2) instead demanded 'm' for every mapping of any readable
+// file, so a profile granting only 'r' on /etc/ld.so.cache could not map it and
+// glibc reported every library it should have found as missing.
+func TestMmapReadOnlyNeedsNoM(t *testing.T) {
+	SetPolicy(map[string]*Profile{
+		"p": {Name: "p", Rules: []Rule{
+			{Pattern: "/etc/ld.so.cache", Perms: ParsePerms("r")},
+			{Pattern: "/usr/share/zoneinfo/**", Perms: ParsePerms("r")},
+			{Pattern: "/lib/**", Perms: ParsePerms("mr")},
+		}},
+	})
+	defer SetPolicy(nil)
+
+	creds := auth.NewAnonymousCredentials()
+	creds.ConfinementProfile = "p"
+	const mode = linux.FileMode(0644)
+
+	// An executable mapping still requires 'm'.
+	for _, path := range []string{"/etc/ld.so.cache", "/usr/share/zoneinfo/UTC"} {
+		if err := CheckPerms(creds, path, Mmap, mode, auth.KUID(0)); err == nil {
+			t.Errorf("CheckPerms(%q, Mmap) = nil, want a denial: the profile grants only r", path)
+		}
+		// Reading it is what the profile grants, and is what a read-only
+		// mapping is mediated by.
+		if err := Check(creds, path, vfs.MayRead, mode, auth.KUID(0)); err != nil {
+			t.Errorf("Check(%q, MayRead) = %v, want nil", path, err)
+		}
+	}
+	if err := CheckPerms(creds, "/lib/x86_64-linux-gnu/libc.so.6", Mmap, mode, auth.KUID(0)); err != nil {
+		t.Errorf("CheckPerms(libc, Mmap) = %v, want nil: the profile grants m", err)
+	}
+}
+
+// TestTransitionScrubsEnvironment covers the uppercase transition modifiers,
+// which apparmor.d(5) defines as invoking "the Linux Kernel's unsafe_exec
+// routines to scrub the environment, similar to setuid programs". The lowercase
+// forms do not.
+func TestTransitionScrubsEnvironment(t *testing.T) {
+	SetPolicy(map[string]*Profile{
+		"p": {Name: "p", ExecRules: []ExecRule{
+			{Pattern: "/bin/px", Mode: ExecProfile, Target: "jail"},
+			{Pattern: "/bin/Px", Mode: ExecProfile, Target: "jail", Scrub: true},
+			{Pattern: "/bin/cx", Mode: ExecChild, Target: "kid"},
+			{Pattern: "/bin/Cx", Mode: ExecChild, Target: "kid", Scrub: true},
+			{Pattern: "/bin/ux", Mode: ExecUnconfined},
+			{Pattern: "/bin/Ux", Mode: ExecUnconfined, Scrub: true},
+			{Pattern: "/bin/ix", Mode: ExecInherit},
+		}},
+		"jail":   {Name: "jail"},
+		"p//kid": {Name: "p//kid"},
+	})
+	defer SetPolicy(nil)
+
+	for path, wantScrub := range map[string]bool{
+		"/bin/px": false,
+		"/bin/Px": true,
+		"/bin/cx": false,
+		"/bin/Cx": true,
+		"/bin/ux": false,
+		"/bin/Ux": true,
+		"/bin/ix": false,
+	} {
+		_, scrub, err := TransitionOnExec("p", path)
+		if err != nil {
+			t.Errorf("TransitionOnExec(%q) = %v", path, err)
+			continue
+		}
+		if scrub != wantScrub {
+			t.Errorf("TransitionOnExec(%q) scrub = %t, want %t", path, scrub, wantScrub)
 		}
 	}
 }

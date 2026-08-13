@@ -904,15 +904,35 @@ func (d *dentry) checkConfinement(creds *auth.Credentials, ats vfs.AccessTypes) 
 	if !creds.Confined() {
 		return nil
 	}
+	mode := linux.FileMode(d.mode.Load())
+	return confine.Check(creds, d.confinePath(), ats, mode, auth.KUID(d.uid.Load()))
+}
+
+// confinePath returns the path of d as the application sees it.
+func (d *dentry) confinePath() string {
 	// Walk to the filesystem root, collecting names.
 	var names []string
 	for cur := d; cur != nil; cur = cur.parent.Load() {
 		names = append(names, cur.name)
 	}
 	mode := linux.FileMode(d.mode.Load())
-	path := confine.Path(d.fs.opts.MountPath, names,
+	return confine.Path(d.fs.opts.MountPath, names,
 		mode.FileType() == linux.ModeDirectory)
-	return confine.Check(creds, path, ats, mode, auth.KUID(d.uid.Load()))
+}
+
+// checkChildConfinement evaluates confinement for an operation on the name
+// child within directory d, against the path that child has. Creating,
+// removing and renaming an entry are mediated by a rule for the entry's own
+// path, not by a write rule on the directory holding it.
+func (d *dentry) checkChildConfinement(creds *auth.Credentials, child string, ats vfs.AccessTypes) error {
+	if !creds.Confined() {
+		return nil
+	}
+	path := d.confinePath()
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	return confine.Check(creds, path+child, ats, linux.FileMode(0), auth.KUID(creds.EffectiveKUID))
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {

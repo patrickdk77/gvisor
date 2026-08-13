@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -484,8 +485,16 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	defer mnt.EndWrite()
 
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+	if err := parent.checkDACPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		// Existence check takes precedence.
+		if existenceErr := checkExistence(); existenceErr != nil {
+			return existenceErr
+		}
+		return err
+	}
+	// Creating name is mediated by a rule for name's own path, not by a
+	// write rule on the directory holding it.
+	if err := parent.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
 		if existenceErr := checkExistence(); existenceErr != nil {
 			return existenceErr
 		}
@@ -567,7 +576,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	if err != nil {
 		return err
 	}
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := parent.checkDACPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -576,6 +585,11 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	defer rp.Mount().EndWrite()
 
 	name := rp.Component()
+	// Removing name is mediated by a rule for name's own path, not by a
+	// write rule on the directory holding it.
+	if err := parent.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+		return err
+	}
 	if dir {
 		if name == "." {
 			return linuxerr.EINVAL
@@ -820,6 +834,11 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 	err := fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		if rp.Mount() != vd.Mount() {
 			return nil, linuxerr.EXDEV
+		}
+		// 'l' allows the program "to be able to create a link with this
+		// name", so it is required for the name being created.
+		if err := parent.checkChildPerm(rp.Credentials(), name, confine.Link); err != nil {
+			return nil, err
 		}
 		d := vd.Dentry().Impl().(*dentry)
 		if d.isDir() {
@@ -1085,7 +1104,23 @@ var logRejectedFifoOpenOnce sync.Once
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 
-	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+	if opts.Flags&linux.O_APPEND != 0 && ats.MayWrite() {
+		// Append mode "will prevent an application from opening the file
+		// for write unless it passes the O_APPEND parameter flag on
+		// open", so an O_APPEND write is permitted by either 'a' or 'w'.
+		// Check the read part normally and the write part as an append.
+		if err := d.checkDACPermissions(rp.Credentials(), ats); err != nil {
+			return nil, err
+		}
+		if ats.MayRead() {
+			if err := d.checkDentryConfinement(rp.Credentials(), vfs.MayRead); err != nil {
+				return nil, err
+			}
+		}
+		if err := d.checkAppendWriteConfinement(rp.Credentials()); err != nil {
+			return nil, err
+		}
+	} else if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
 	if !d.inode.isSynthetic() {
@@ -1435,6 +1470,14 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 	}
 	creds := rp.Credentials()
+	// Renaming is mediated by rules for the two paths involved, not by write
+	// rules on the directories holding them.
+	if err := oldParent.checkChildConfinement(creds, oldName, vfs.MayWrite); err != nil {
+		return err
+	}
+	if err := newParent.checkChildConfinement(creds, newName, vfs.MayWrite); err != nil {
+		return err
+	}
 	if err := oldParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}

@@ -132,7 +132,7 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		// AppArmor profile the task has entered, if any. Without this, a
 		// task denied 'x' on a file it can write could still execute its
 		// contents by mapping them.
-		if err := checkMmapConfinement(t, file, opts.MaxPerms.Execute); err != nil {
+		if err := checkMmapConfinement(t, file, opts.Perms.Execute); err != nil {
 			return 0, nil, err
 		}
 
@@ -430,8 +430,14 @@ func traceMmap(t *kernel.Task, file *vfs.FileDescription) error {
 }
 
 // checkMmapConfinement evaluates the 'm' permission of the profile the calling
-// task has entered against the file being mapped. It is a no-op for
-// unconfined tasks and for mappings that can never become executable.
+// task has entered against the file being mapped. It is a no-op for unconfined
+// tasks and for mappings the caller did not ask to be executable.
+//
+// The test is what the caller requested, not what the mapping could become
+// through mprotect(2): AppArmor's 'm' mediates PROT_EXEC on the mmap call.
+// Using the latter demanded 'm' for every mapping of any readable file, so a
+// profile granting only 'r' on /etc/ld.so.cache could not map it, and glibc
+// then reported every library it should have found as missing.
 //
 // The check is done here rather than in FileDescriptionImpl.ConfigureMMap
 // because the ELF loader shares that path: requiring 'm' there would deny
@@ -447,10 +453,13 @@ func checkMmapConfinement(t *kernel.Task, file *vfs.FileDescription, mayExec boo
 	vd := file.VirtualDentry()
 	path, err := t.Kernel().VFS().PathnameWithDeleted(t, root, vd)
 	if err != nil {
-		// Without a path there is no rule to match, so deny rather than
-		// leave the mapping unmediated.
-		log.Warningf("confinement: profile %q denied m of an unreachable file: %v", creds.ConfinementProfile, err)
-		return linuxerr.EACCES
+		// A file with no path the application can name has no rule to
+		// match, the same situation as a mount whose path is unknown.
+		// Denying instead refused every executable mapping whose path
+		// could not be resolved, which breaks dlopen(3) for reasons the
+		// profile has nothing to say about.
+		log.Debugf("confinement: profile %q: mapping a file with no reachable path is not mediated: %v", creds.ConfinementProfile, err)
+		return nil
 	}
 	stat, err := file.Stat(t, vfs.StatOptions{
 		Mask: linux.STATX_MODE | linux.STATX_UID,

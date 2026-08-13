@@ -335,11 +335,18 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	// "px" enters a named profile, "ux" runs unconfined. An unconfined task
 	// enters the profile named after the executable, if there is one.
 	// c is already a private copy; see auth.ComputeCredsForExec().
-	newProfile, err := confine.TransitionOnExec(c.ConfinementProfile, execPath)
+	newProfile, scrubEnv, err := confine.TransitionOnExec(c.ConfinementProfile, execPath)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to enter an AppArmor profile for %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
 	c.ConfinementProfile = newProfile
+	if scrubEnv {
+		// The uppercase transition modifiers "invoke the Linux Kernel's
+		// unsafe_exec routines to scrub the environment, similar to
+		// setuid programs", which is what AT_SECURE signals to the
+		// dynamic linker.
+		secureExec = true
+	}
 	secureExecInt := 0
 	if secureExec {
 		secureExecInt = 1

@@ -511,7 +511,6 @@ profile p {
   /bin/named mrpx -> jail,
   /bin/scrubbed mrPx -> jail,
   /bin/kid mrcx -> kid,
-  /bin/plain mrx,
   deny /bin/denied mrix,
   /etc/passwd r,
 }
@@ -528,12 +527,11 @@ profile p {
 		// "file," grants exec over everything with no modifier.
 		{Pattern: "/**"},
 		{Pattern: "/bin/inherit", Mode: confine.ExecInherit},
-		{Pattern: "/bin/unconfined", Mode: confine.ExecUnconfined},
+		{Pattern: "/bin/unconfined", Mode: confine.ExecUnconfined, Scrub: true},
 		{Pattern: "/bin/lower", Mode: confine.ExecUnconfined},
 		{Pattern: "/bin/named", Mode: confine.ExecProfile, Target: "jail"},
-		{Pattern: "/bin/scrubbed", Mode: confine.ExecProfile, Target: "jail"},
+		{Pattern: "/bin/scrubbed", Mode: confine.ExecProfile, Target: "jail", Scrub: true},
 		{Pattern: "/bin/kid", Mode: confine.ExecChild, Target: "kid"},
-		{Pattern: "/bin/plain", Mode: confine.ExecDefault},
 	}
 	if !reflect.DeepEqual(cp.ExecRules, want) {
 		t.Errorf("ExecRules = %+v, want %+v", cp.ExecRules, want)
@@ -544,5 +542,48 @@ profile p {
 		if r.Pattern == "/etc/passwd" || r.Pattern == "/bin/denied" {
 			t.Errorf("ExecRules contains %q, which grants no exec", r.Pattern)
 		}
+	}
+}
+
+// TestBareExecRejected covers apparmor.d(5): "A bare 'x' is only allowed in
+// rules with the deny qualifier". An allow rule carrying one names no
+// transition, and picking one would be inventing policy, so it is reported as
+// unenforced instead.
+func TestBareExecRejected(t *testing.T) {
+	policy := &AppArmorPolicy{}
+	const profile = `
+profile p {
+  /bin/plain mrx,
+  /bin/fine mrix,
+  deny /bin/nope x,
+}
+`
+	if err := ParseAppArmorProfiles(strings.NewReader(profile), "t", policy, make(tunables)); err != nil {
+		t.Fatalf("ParseAppArmorProfiles: %v", err)
+	}
+	cp := policy.Rules["p"]
+	for _, r := range cp.Rules {
+		if r.Pattern == "/bin/plain" {
+			t.Error("a bare x allow rule produced a file rule")
+		}
+	}
+	var reported bool
+	for _, u := range policy.Unenforced {
+		if strings.Contains(u.Line, "/bin/plain") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Error("a bare x allow rule was dropped without being reported")
+	}
+	// The qualified rule is kept, and the deny rule is unaffected.
+	var haveFine bool
+	for _, r := range cp.ExecRules {
+		if r.Pattern == "/bin/fine" && r.Mode == confine.ExecInherit {
+			haveFine = true
+		}
+	}
+	if !haveFine {
+		t.Error("a qualified exec rule was not kept")
 	}
 }

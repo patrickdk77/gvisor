@@ -60,6 +60,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -2480,7 +2481,24 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
+// checkLockConfinement evaluates the 'k' permission, which apparmor.d(5)
+// defines as allowing the program "to be able lock a file with this name" and
+// which "covers both advisory and mandatory locking".
+func (fd *fileDescription) checkLockConfinement(ctx context.Context) error {
+	creds := auth.CredentialsFromContext(ctx)
+	if creds == nil || !creds.Confined() {
+		return nil
+	}
+	d := fd.dentry()
+	mode := linux.FileMode(d.inode.mode.Load())
+	return confine.CheckPerms(creds, d.confinePath(), confine.Lock, mode,
+		auth.KUID(d.inode.uid.Load()))
+}
+
 func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
 	fd.lockLogging.Do(func() {
 		log.Infof("File lock using gofer file handled internally.")
 	})
@@ -2489,6 +2507,9 @@ func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, own
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
 func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
 	fd.lockLogging.Do(func() {
 		log.Infof("Range lock using gofer file handled internally.")
 	})
