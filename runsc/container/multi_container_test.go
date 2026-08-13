@@ -3804,11 +3804,18 @@ func TestCheckpointRestoreAnnotation(t *testing.T) {
 	} else if ws != 0 {
 		t.Fatalf("/proc/gvisor/checkpoint is writable in the first container: %v", ws)
 	}
-	// * spec_environ file should exist and be readable
-	if ws, err := execute(conf, conts[0], "/usr/bin/test", "-r", "/proc/gvisor/spec_environ"); err != nil {
+	// * spec_environ holds the container's initial environment, secrets
+	//   included, so it exists only for the container that asked to drive
+	//   checkpointing, and only its owner may read it.
+	if ws, err := execute(conf, conts[1], "/usr/bin/test", "-r", "/proc/gvisor/spec_environ"); err != nil {
 		t.Fatal(err)
 	} else if ws != 0 {
-		t.Fatalf("/proc/gvisor/spec_environ does not exist or is not readable in the first container: %v", ws)
+		t.Fatalf("/proc/gvisor/spec_environ does not exist or is not readable in the second container: %v", ws)
+	}
+	if ws, err := execute(conf, conts[0], "/usr/bin/test", "!", "-e", "/proc/gvisor/spec_environ"); err != nil {
+		t.Fatal(err)
+	} else if ws != 0 {
+		t.Fatalf("/proc/gvisor/spec_environ exists in the first container, which did not enable checkpointing: %v", ws)
 	}
 
 	// Restore into a new container with same IDs (e.g. clone). It requires the

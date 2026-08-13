@@ -234,8 +234,10 @@ This functionality is configured entirely through OCI runtime spec
 
 ### Enabling and Configuration
 
-The files `/proc/gvisor/checkpoint` and `/proc/gvisor/spec_environ` are always
-present in the sandbox.
+`/proc/gvisor/checkpoint` is always present in the sandbox.
+`/proc/gvisor/spec_environ` is present only for a container whose
+`dev.gvisor.internal.checkpoint.enable` annotation is set, since it exposes that
+container's initial environment.
 
 By default, `/proc/gvisor/checkpoint` is read-only (mode `0444`): a workload can
 read it to *wait* for the next resume/restore (which might be triggered
@@ -322,9 +324,16 @@ cat <&3   # blocks until resume/restore completes, prints "resume" or "restore"
 
 ### Reading restore-time environment via `/proc/gvisor/spec_environ`
 
-When application-driven checkpointing is enabled, gVisor also exposes
-`/proc/gvisor/spec_environ`. It contains the environment variables from the
-container's spec (NULL-separated, in the same format as `/proc/<pid>/environ`).
+When application-driven checkpointing is enabled on a container, gVisor also
+exposes `/proc/gvisor/spec_environ` in that container. It contains the
+environment variables from the container's spec (NULL-separated, in the same
+format as `/proc/<pid>/environ`).
+
+The file is mode `0400`, owned by root, and is absent from containers that did
+not set the annotation. A spec environment usually carries secrets, and this
+file is the whole container's initial environment rather than one process's, so
+it is not readable by every user in the container the way `0444` would make it.
+A workload that reads it must therefore run as the file's owner.
 
 Because the environment variables in the spec used to *restore* a container can
 differ from the one used to create it, this file gives the workload a way to
