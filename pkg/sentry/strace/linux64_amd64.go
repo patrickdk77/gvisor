@@ -375,6 +375,7 @@ var linuxAMD64 = SyscallMap{
 	436: makeSyscallInfo("close_range", FD, FD, CloseRangeFlags),
 	439: makeSyscallInfo("faccessat2", FD, Path, Oct, Hex),
 	441: makeSyscallInfo("epoll_pwait2", FD, EpollEvents, Hex, Timespec, SigSet),
+	452: makeSyscallInfo("fchmodat2", FD, Path, Mode, Hex),
 }
 
 func init() {

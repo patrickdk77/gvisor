@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -295,6 +296,73 @@ TEST(ChmodTest, ChmodWritableWithOpenFD) {
   char c = 'a';
   EXPECT_THAT(WriteFd(fd1.get(), &c, 1), SyscallFailsWithErrno(EBADF));
   EXPECT_THAT(WriteFd(fd2.get(), &c, 1), SyscallSucceedsWithValue(1));
+}
+
+
+// fchmodat2(2) is syscall 452 and is not in glibc on every distribution, so it
+// is called directly.
+int fchmodat2(int dirfd, const char* path, mode_t mode, int flags) {
+  return syscall(452, dirfd, path, mode, flags);
+}
+
+TEST(ChmodTest, Fchmodat2ChangesMode) {
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "", 0666));
+  SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0444, 0) < 0 &&
+          errno == ENOSYS);
+
+  ASSERT_THAT(fchmodat2(AT_FDCWD, file.path().c_str(), 0444, 0),
+              SyscallSucceeds());
+  struct stat st;
+  ASSERT_THAT(stat(file.path().c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode & 07777, 0444);
+}
+
+TEST(ChmodTest, Fchmodat2RejectsUnknownFlags) {
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0644, 0) < 0 &&
+          errno == ENOSYS);
+
+  // do_fchmodat() takes only AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH.
+  EXPECT_THAT(fchmodat2(AT_FDCWD, file.path().c_str(), 0644, 0x8000),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(ChmodTest, Fchmodat2SymlinkNofollowIsUnsupported) {
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0644, 0) < 0 &&
+          errno == ENOSYS);
+  const auto link = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), file.path()));
+
+  // A symlink has no mode of its own to change, which chmod(2) records as
+  // AT_SYMLINK_NOFOLLOW being "not currently supported by any filesystem, so
+  // specifying it will result in an EOPNOTSUPP error".
+  EXPECT_THAT(fchmodat2(AT_FDCWD, link.path().c_str(), 0600,
+                        AT_SYMLINK_NOFOLLOW),
+              SyscallFailsWithErrno(EOPNOTSUPP));
+
+  // Following the link changes the target instead.
+  ASSERT_THAT(fchmodat2(AT_FDCWD, link.path().c_str(), 0600, 0),
+              SyscallSucceeds());
+  struct stat st;
+  ASSERT_THAT(stat(file.path().c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode & 07777, 0600);
+}
+
+TEST(ChmodTest, Fchmodat2EmptyPath) {
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "", 0666));
+  SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0666, 0) < 0 &&
+          errno == ENOSYS);
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
+
+  ASSERT_THAT(fchmodat2(fd.get(), "", 0640, AT_EMPTY_PATH),
+              SyscallSucceeds());
+  struct stat st;
+  ASSERT_THAT(stat(file.path().c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode & 07777, 0640);
 }
 
 }  // namespace

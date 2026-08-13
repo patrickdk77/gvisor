@@ -398,6 +398,7 @@ var AMD64 = &kernel.SyscallTable{
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
+		452: syscalls.Supported("fchmodat2", Fchmodat2),
 	},
 	Emulate: map[hostarch.Addr]uintptr{
 		0xffffffffff600000: 96,  // vsyscall gettimeofday(2)
@@ -720,6 +721,7 @@ var ARM64 = &kernel.SyscallTable{
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
+		452: syscalls.Supported("fchmodat2", Fchmodat2),
 	},
 	Emulate: map[hostarch.Addr]uintptr{},
 	Missing: func(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {

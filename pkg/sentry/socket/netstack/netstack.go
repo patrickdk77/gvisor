@@ -2005,6 +2005,21 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		ep.SocketOptions().SetReceiveBufferSize(clamped, true /* notify */)
 		return nil
 
+	case linux.SO_SNDBUFFORCE:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+
+		if !t.HasRootCapability(linux.CAP_NET_ADMIN) {
+			return syserr.ErrNotPermitted
+		}
+
+		v := hostarch.ByteOrder.Uint32(optVal)
+		min, max := ep.SocketOptions().SendBufferLimits()
+		clamped := clampBufSize(int64(v), min, max, true /* ignoreMax */)
+		ep.SocketOptions().SetSendBufferSize(clamped, true /* notify */)
+		return nil
+
 	case linux.SO_RCVBUFFORCE:
 		if len(optVal) < sizeOfInt32 {
 			return syserr.ErrInvalidArgument
@@ -2193,7 +2208,6 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		linux.SO_TIMESTAMP,
 		linux.SO_ACCEPTCONN,
 		linux.SO_PEERSEC,
-		linux.SO_SNDBUFFORCE,
 		linux.SO_PASSSEC,
 		linux.SO_TIMESTAMPNS,
 		linux.SO_TIMESTAMPING,

@@ -1378,6 +1378,61 @@ func fchmodat(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, mode uint) er
 	})
 }
 
+// Fchmodat2 implements Linux syscall fchmodat2(2).
+func Fchmodat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	dirfd := args[0].Int()
+	pathAddr := args[1].Pointer()
+	mode := args[2].ModeT()
+	flags := args[3].Int()
+
+	// do_fchmodat() takes only these two flags and rejects the rest:
+	//
+	//	if (unlikely(flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)))
+	//		return -EINVAL;
+	//
+	// AT_SYMLINK_NOFOLLOW is honored here rather than refused: it drops
+	// LOOKUP_FOLLOW, and it is the filesystem that then reports EOPNOTSUPP
+	// for a symlink, which is what "not currently supported by any
+	// filesystem" in chmod(2) refers to.
+	if flags&^(linux.AT_SYMLINK_NOFOLLOW|linux.AT_EMPTY_PATH) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	path, err := copyInPath(t, pathAddr)
+	if err != nil {
+		return 0, nil, err
+	}
+	follow := shouldFollowFinalSymlink(flags&linux.AT_SYMLINK_NOFOLLOW == 0)
+	emptyPath := shouldAllowEmptyPath(flags&linux.AT_EMPTY_PATH != 0)
+	if flags&linux.AT_SYMLINK_NOFOLLOW != 0 {
+		// A symlink has no mode of its own to change, so no filesystem
+		// implements a mode change for one, which is what chmod(2) means
+		// by AT_SYMLINK_NOFOLLOW being "not currently supported by any
+		// filesystem, so specifying it will result in an EOPNOTSUPP
+		// error". Report it here: the Sentry's own filesystems would
+		// otherwise accept the change and record a mode nothing reads.
+		tpop, err := getTaskPathOperation(t, dirfd, path, emptyPath, follow)
+		if err != nil {
+			return 0, nil, err
+		}
+		stat, err := t.Kernel().VFS().StatAt(t, t.Credentials(), &tpop.pop, &vfs.StatOptions{
+			Mask: linux.STATX_TYPE,
+		})
+		tpop.Release(t)
+		if err != nil {
+			return 0, nil, err
+		}
+		if stat.Mask&linux.STATX_TYPE != 0 && linux.FileMode(stat.Mode).FileType() == linux.ModeSymlink {
+			return 0, nil, linuxerr.EOPNOTSUPP
+		}
+	}
+	return 0, nil, setstatat(t, dirfd, path, emptyPath, follow, &vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: linux.STATX_MODE,
+			Mode: uint16(mode & chmodMask),
+		},
+	})
+}
+
 // Fchmod implements Linux syscall fchmod(2).
 func Fchmod(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
