@@ -350,6 +350,14 @@ func ReadMounts(f *os.File) ([]specs.Mount, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error reading mounts: %v", err)
 	}
+	if len(bytes) == 0 {
+		// The mount list arrives over a pipe whose only writers are the gofer
+		// and its children, so a clean end of file with nothing in it means
+		// the gofer exited before publishing the list. Reporting that as
+		// malformed JSON blames the reader for the writer's death and throws
+		// away the real failure, which the gofer logged before it exited.
+		return nil, fmt.Errorf("the gofer exited before sending its mount list; its log has the reason it failed")
+	}
 	var mounts []specs.Mount
 	if err := json.Unmarshal(bytes, &mounts); err != nil {
 		return nil, fmt.Errorf("error unmarshaling mounts: %v\nJSON bytes:\n%s", err, string(bytes))
