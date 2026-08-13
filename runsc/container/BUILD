@@ -49,6 +49,7 @@ go_test(
     name = "container_test",
     size = "large",
     srcs = [
+        "apparmor_audit_test.go",
         "console_test.go",
         "container_test.go",
         "metric_server_test.go",

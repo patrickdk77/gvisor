@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Caller provides the droppedIDs slice to collect dropped mapping
@@ -616,4 +617,30 @@ func (vgap vmaGapIterator) availableRange() hostarch.AddrRange {
 	}
 	ar.End -= guardBytes
 	return ar
+}
+
+// FileMappingsForExec returns the file descriptions backing the vmas that
+// overlap ar, each with a reference the caller must release. It is used to
+// mediate mprotect: AppArmor's file_mprotect hook requires the 'm' permission
+// to add PROT_EXEC to a file mapping, the same as mapping it executable in the
+// first place, so a task cannot map a file readable (needing no 'm') and then
+// make it executable to run its contents. Anonymous mappings and mappings whose
+// identity is not a file are skipped, as they are on a host kernel.
+func (mm *MemoryManager) FileMappingsForExec(ar hostarch.AddrRange) []*vfs.FileDescription {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
+	var out []*vfs.FileDescription
+	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
+		id := vseg.ValuePtr().id
+		if id == nil {
+			continue
+		}
+		fd, ok := id.(*vfs.FileDescription)
+		if !ok {
+			continue
+		}
+		fd.IncRef()
+		out = append(out, fd)
+	}
+	return out
 }

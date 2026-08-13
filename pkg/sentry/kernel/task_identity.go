@@ -15,6 +15,8 @@
 package kernel
 
 import (
+	"errors"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/confine"
@@ -454,7 +456,7 @@ func (t *Task) EnterConfinementProfile(name string) error {
 	if creds.ConfinementProfile == name {
 		return nil
 	}
-	if err := confine.CheckChangeProfile(creds.ConfinementProfile, name); err != nil {
+	if err := confine.CheckChangeProfile(t, creds.ConfinementProfile, name); err != nil {
 		return err
 	}
 	// The credentials object is immutable. See doc for creds.
@@ -556,4 +558,102 @@ func (t *Task) ClearAmbientCapabilities() {
 	creds := t.Credentials().Fork()
 	creds.AmbientCaps = 0
 	t.creds.Store(creds)
+}
+
+// EnterConfinementHat makes the task enter the hat named hat of the profile it
+// is in, as aa_change_hat(3) does. The magic token must be presented again to
+// return to the profile.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) EnterConfinementHat(hat string, token uint64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	if !creds.Confined() {
+		return linuxerr.EPERM
+	}
+	target, err := confine.CheckChangeHat(creds.ConfinementProfile, hat)
+	if err != nil {
+		return err
+	}
+	newCreds := creds.Fork()
+	newCreds.HatParent = creds.ConfinementProfile
+	newCreds.HatToken = token
+	newCreds.ConfinementProfile = target
+	t.creds.Store(newCreds)
+	return nil
+}
+
+// LeaveConfinementHat returns the task to the profile it entered its hat from.
+//
+// Per aa_change_hat(2), if the token does not match the one the task entered
+// with, "the change back to the original profile will not happen, and the
+// current task will be killed". The caller kills the task when this returns
+// ErrHatTokenMismatch.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) LeaveConfinementHat(token uint64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	if creds.HatToken == 0 {
+		// Not in a hat.
+		return linuxerr.EPERM
+	}
+	if creds.HatToken != token {
+		return ErrHatTokenMismatch
+	}
+	newCreds := creds.Fork()
+	newCreds.ConfinementProfile = creds.HatParent
+	newCreds.HatParent = ""
+	newCreds.HatToken = 0
+	t.creds.Store(newCreds)
+	return nil
+}
+
+// ErrHatTokenMismatch is returned by LeaveConfinementHat() when the magic token
+// does not match the one the task entered its hat with.
+var ErrHatTokenMismatch = errors.New("apparmor hat magic token mismatch")
+
+// StackConfinementProfile stacks a profile onto the task's label, as
+// aa_stack_profile(3) does. Every profile of a stacked label must permit an
+// access, so stacking can only reduce what the task may do.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) StackConfinementProfile(name string) error {
+	if len(name) == 0 {
+		return linuxerr.EINVAL
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	if err := confine.CheckChangeProfile(t, creds.ConfinementProfile, name); err != nil {
+		return err
+	}
+	newCreds := creds.Fork()
+	newCreds.ConfinementProfile = confine.StackLabel(creds.ConfinementProfile, name)
+	t.creds.Store(newCreds)
+	return nil
+}
+
+// SetConfinementOnExec records the label to enter at the next execve(2), as
+// aa_change_onexec(3) and aa_stack_onexec(3) do. A stacked request records the
+// label the stack would produce.
+//
+// Preconditions: The caller must be running on the task goroutine.
+func (t *Task) SetConfinementOnExec(name string, stack bool) error {
+	if len(name) == 0 {
+		return linuxerr.EINVAL
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	newCreds := creds.Fork()
+	if stack {
+		newCreds.OnExecProfile = confine.StackLabel(creds.ConfinementProfile, name)
+	} else {
+		newCreds.OnExecProfile = name
+	}
+	t.creds.Store(newCreds)
+	return nil
 }

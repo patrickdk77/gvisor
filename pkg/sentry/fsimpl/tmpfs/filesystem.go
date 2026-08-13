@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
@@ -57,7 +58,7 @@ func stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*dentry,
 	if !ok {
 		return nil, false, linuxerr.ENOTDIR
 	}
-	if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := d.checkPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, false, err
 	}
 	name := rp.Component()
@@ -167,7 +168,7 @@ func resolveLocked(ctx context.Context, rp *vfs.ResolvingPath) (*dentry, error) 
 // Preconditions:
 //   - !rp.Done().
 //   - For the final path component in rp, !rp.ShouldFollowSymlink().
-func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parentDir *directory, name string) error) error {
+func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, op confine.Op, dir bool, create func(parentDir *directory, name string) error) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	parentDir, err := walkParentDirLocked(ctx, rp, rp.Start().Impl().(*dentry))
@@ -177,7 +178,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 
 	// Order of checks is important. First check if parent directory can be
 	// executed, then check for existence, and lastly check if mount is writable.
-	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
@@ -204,11 +205,11 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	defer mnt.EndWrite()
 
-	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+	if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 		return err
 	}
 	// Creating name is mediated by a rule for name's own path.
-	if err := parentDir.dentry.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+	if err := parentDir.dentry.checkChildCreateConfinement(ctx, rp.Credentials(), op, name, dir); err != nil {
 		return err
 	}
 	if err := create(parentDir, name); err != nil {
@@ -232,7 +233,12 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err != nil {
 		return err
 	}
-	if err := d.checkPermissions(creds, ats); err != nil {
+	// access(2) asks whether an access would be permitted rather than making
+	// one, and Linux's AppArmor does not hook it: there is no
+	// security_inode_permission() mediation, so the answer follows from the
+	// mode bits alone. Mediating it here would deny more than a host kernel
+	// does.
+	if err := d.inode.checkPermissions(creds, ats); err != nil {
 		return err
 	}
 	if ats.MayWrite() && rp.Mount().ReadOnly() {
@@ -253,7 +259,7 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 		if !d.inode.isDir() {
 			return nil, linuxerr.ENOTDIR
 		}
-		if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+		if err := d.checkPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
 			return nil, err
 		}
 	}
@@ -275,7 +281,7 @@ func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPa
 
 // LinkAt implements vfs.FilesystemImpl.LinkAt.
 func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.VirtualDentry) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+	return fs.doCreateAt(ctx, rp, confine.OpLink, false /* dir */, func(parentDir *directory, name string) error {
 		if rp.Mount() != vd.Mount() {
 			return linuxerr.EXDEV
 		}
@@ -285,6 +291,11 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return linuxerr.EPERM
 		}
 		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(i.mode.Load()), i.accessACL.Load(), auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
+			return err
+		}
+		// The link rules decide whether this pair may be linked, and the
+		// subset condition whether the link may be broader than d.
+		if err := parentDir.dentry.checkLinkConfinement(ctx, rp.Credentials(), name, d.confinePath(), linux.FileMode(i.mode.Load()), auth.KUID(i.uid.Load())); err != nil {
 			return err
 		}
 		if i.nlink.Load() == 0 {
@@ -302,7 +313,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
-	return fs.doCreateAt(ctx, rp, true /* dir */, func(parentDir *directory, name string) error {
+	return fs.doCreateAt(ctx, rp, confine.OpMkdir, true /* dir */, func(parentDir *directory, name string) error {
 		creds := rp.Credentials()
 		if parentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
@@ -320,7 +331,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+	return fs.doCreateAt(ctx, rp, confine.OpMknod, false /* dir */, func(parentDir *directory, name string) error {
 		creds := rp.Credentials()
 		var childInode *inode
 		var err error
@@ -397,7 +408,7 @@ afterTrailingSymlink:
 		return nil, err
 	}
 	// Check for search permission in the parent directory.
-	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+	if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
 	// Reject attempts to open directories with O_CREAT.
@@ -421,7 +432,15 @@ afterTrailingSymlink:
 	}
 	if linuxerr.Equals(linuxerr.ENOENT, err) {
 		// Already checked for searchability above; now check for writability.
-		if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+		if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
+			return nil, err
+		}
+		// Creating the file is an access to the new file's own path, which
+		// is what AppArmor mediates for an O_CREAT open.
+		// The request is the open's own permissions plus 'w', which is
+		// what grants AA_MAY_CREATE, so an O_RDWR create asks for 'r'
+		// too.
+		if err := parentDir.dentry.checkChildConfinement(ctx, rp.Credentials(), confine.OpCreate, name, vfs.AccessTypesForOpenFlags(&opts)|vfs.MayWrite); err != nil {
 			return nil, err
 		}
 		if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -468,7 +487,7 @@ afterTrailingSymlink:
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, afterCreate bool) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if !afterCreate {
-		if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+		if err := d.checkOpenPermissions(ctx, rp.Credentials(), ats, uint32(opts.Flags), opts.FileExec); err != nil {
 			return nil, err
 		}
 	}
@@ -590,14 +609,14 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	defer mnt.EndWrite()
 
 	oldParentDir := oldParentVD.Dentry().Impl().(*dentry).inode.impl.(*directory)
-	if err := oldParentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := oldParentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	// Renaming is mediated by rules for the two paths involved.
-	if err := oldParentDir.dentry.checkChildConfinement(rp.Credentials(), oldName, vfs.MayWrite); err != nil {
+	if err := oldParentDir.dentry.checkChildConfinement(ctx, rp.Credentials(), confine.OpRenameSrc, oldName, vfs.MayWrite); err != nil {
 		return err
 	}
-	if err := newParentDir.dentry.checkChildConfinement(rp.Credentials(), newName, vfs.MayWrite); err != nil {
+	if err := newParentDir.dentry.checkChildConfinement(ctx, rp.Credentials(), confine.OpRenameDest, newName, vfs.MayWrite); err != nil {
 		return err
 	}
 	renamed, ok := oldParentDir.childMap[oldName]
@@ -616,7 +635,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 		if oldParentDir != newParentDir {
 			// Writability is needed to change renamed's "..".
-			if err := renamed.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+			if err := renamed.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 				return err
 			}
 		}
@@ -626,7 +645,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 	}
 
-	if err := newParentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := newParentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	replaced, ok := newParentDir.childMap[newName]
@@ -727,12 +746,12 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err != nil {
 		return err
 	}
-	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
 	// Removing name is mediated by a rule for name's own path.
-	if err := parentDir.dentry.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+	if err := parentDir.dentry.checkChildConfinementDir(ctx, rp.Credentials(), confine.OpRmdir, name, vfs.MayWrite, true /* isDir */); err != nil {
 		return err
 	}
 	if name == "." {
@@ -788,7 +807,10 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.mu.RUnlock()
 		return err
 	}
-	err = d.inode.setStat(ctx, rp.Credentials(), &opts)
+	err = d.checkSetattrConfinement(ctx, rp.Credentials(), confine.SetattrOp(opts.Stat.Mask))
+	if err == nil {
+		err = d.inode.setStat(ctx, rp.Credentials(), &opts)
+	}
 	fs.mu.RUnlock()
 	if err != nil {
 		return err
@@ -831,7 +853,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
-	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+	return fs.doCreateAt(ctx, rp, confine.OpSymlink, false /* dir */, func(parentDir *directory, name string) error {
 		// Linux allocates a page to store symlink targets that have length larger
 		// than shortSymlinkLen. Targets are just stored as string here, but simulate
 		// the page accounting for it. See mm/shmem.c:shmem_symlink().
@@ -867,12 +889,17 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err != nil {
 		return err
 	}
-	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := parentDir.dentry.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	name := rp.Component()
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
+	}
+	// Removing name is mediated by a rule for name's own path, not by a
+	// write rule on the directory holding it.
+	if err := parentDir.dentry.checkChildConfinement(ctx, rp.Credentials(), confine.OpUnlink, name, vfs.MayWrite); err != nil {
+		return err
 	}
 	child, ok := parentDir.childMap[name]
 	if !ok {
@@ -917,7 +944,7 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 	if err != nil {
 		return nil, err
 	}
-	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+	if err := d.checkPermissions(ctx, rp.Credentials(), vfs.MayWrite); err != nil {
 		return nil, err
 	}
 	switch impl := d.inode.impl.(type) {

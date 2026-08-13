@@ -1,0 +1,93 @@
+abi <abi/3.0>,
+
+profile gvisor-behav2 {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** rw,
+  /tmp/aa2/ r,
+  /tmp/aa2/probe.py r,
+
+  /tmp/aa2/rdonly r,
+  /tmp/aa2/append-only a,
+  /tmp/aa2/dw rw,
+  deny /tmp/aa2/dw w,
+  owner /tmp/aa2/owner/* r,
+  /tmp/aa2/exec-map rm,
+  /tmp/aa2/noexec-map r,
+  /tmp/aa2/ltarget rw,
+  /tmp/aa2/lnew rwl,
+  /tmp/aa2/lnew2 rw,
+
+  /tmp/aa2/bin/cat-ix rix,
+  /tmp/aa2/bin/cat-px rpx -> gvisor-behav2-child,
+  /tmp/aa2/bin/cat-ux rux,
+
+  change_profile -> gvisor-behav2-child,
+}
+
+profile gvisor-behav2-child {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+  /tmp/aa2/bin/cat-px rm,
+}
+
+profile gvisor-behav2-complain flags=(complain) {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+}
+
+profile gvisor-behav2-kill flags=(kill) {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+}
+
+profile gvisor-root-noslash {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+  /tmp/** r,
+  # No rule matches "/" itself: not /**, which needs at least one
+  # character after the slash, and nothing else here starts shorter.
+}
+
+profile gvisor-root-slash {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+  /tmp/** r,
+  / r,
+}
+
+profile gvisor-file {
+  file,
+}
+
+profile attachtest /tmp/at/{a,b}/bintest {
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /proc/** r,
+  /tmp/at/** rm,
+}

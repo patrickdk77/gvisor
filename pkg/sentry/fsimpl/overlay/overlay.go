@@ -48,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/confine"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -889,23 +890,83 @@ func (d *dentry) topLookupLayer() lookupLayer {
 	return lookupLayerLower
 }
 
-func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+func (d *dentry) checkPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	if err := vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
 	}
-	return d.checkConfinement(creds, ats)
+	return d.checkConfinement(ctx, creds, confine.OpFperm, ats)
+}
+
+// checkDACPermissions checks the mode, owner and group only. access(2) asks
+// whether an access would be permitted rather than making one, and Linux's
+// AppArmor does not hook it, so the answer follows from the mode bits alone.
+func (d *dentry) checkDACPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
 }
 
 // checkConfinement evaluates the AppArmor profile the accessing task has
 // entered, if any. The rootfs is usually an overlay, so without this the
 // profile would not cover the container's own files, including any setuid
 // binary in the image. See pkg/sentry/confine.
-func (d *dentry) checkConfinement(creds *auth.Credentials, ats vfs.AccessTypes) error {
+func (d *dentry) checkConfinement(ctx context.Context, creds *auth.Credentials, op confine.Op, ats vfs.AccessTypes) error {
 	if !creds.Confined() {
 		return nil
 	}
 	mode := linux.FileMode(d.mode.Load())
-	return confine.Check(creds, d.confinePath(), ats, mode, auth.KUID(d.uid.Load()))
+	if !confine.Mediates(ats, mode.FileType() == linux.ModeDirectory) {
+		// Traversal is not mediated; skip the path construction.
+		return nil
+	}
+	return confine.Check(ctx, creds, confine.OpFperm, d.confinePath(), ats, mode, auth.KUID(d.uid.Load()))
+}
+
+// checkOpenPermissions is checkPermissions for an open, whose flags decide
+// which permissions the profile is asked for: an O_APPEND open asks for 'a'
+// rather than 'w'.
+func (d *dentry) checkOpenPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes, flags uint32, fileExec bool) error {
+	if err := vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), d.accessACL.Load(), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
+		return err
+	}
+	if fileExec {
+		// An open on behalf of execve; see gofer.checkOpenConfinement.
+		return d.checkConfinePerm(ctx, creds, confine.OpExec, confine.Exec)
+	}
+	if !creds.Confined() {
+		return nil
+	}
+	mode := linux.FileMode(d.mode.Load())
+	return confine.CheckOpen(ctx, creds, d.confinePath(), ats, flags, mode,
+		auth.KUID(d.uid.Load()))
+}
+
+// Reading a file's metadata is not mediated. Linux registers an inode_getattr
+// hook, but a real kernel does not deny a stat of a path that no rule in the
+// profile matches: verified against apparmor 4.0.1 with a production profile,
+// where "aa-exec -p cageweb -- stat <site path>" succeeds and audits nothing
+// even though none of that profile's 487 compiled rules match the path.
+// Mediating it here denied what a host kernel permits, which is worse than not
+// mediating it at all.
+
+// checkSetattrConfinement mediates changing d's metadata, which AppArmor asks
+// for AA_MAY_SETATTR, AA_MAY_CHMOD or AA_MAY_CHOWN for, all of which 'w'
+// grants.
+func (d *dentry) checkSetattrConfinement(ctx context.Context, creds *auth.Credentials, op confine.Op) error {
+	return d.checkConfinePerm(ctx, creds, op, confine.Write)
+}
+
+// checkLockConfinement mediates locking d, which AppArmor asks for
+// AA_MAY_LOCK for and 'k' grants.
+func (d *dentry) checkLockConfinement(ctx context.Context, creds *auth.Credentials) error {
+	return d.checkConfinePerm(ctx, creds, confine.OpFlock, confine.Lock)
+}
+
+// checkConfinePerm evaluates one permission against d's path.
+func (d *dentry) checkConfinePerm(ctx context.Context, creds *auth.Credentials, op confine.Op, want confine.Perm) error {
+	if !creds.Confined() {
+		return nil
+	}
+	return confine.CheckPerms(ctx, creds, op, d.confinePath(), want,
+		linux.FileMode(d.mode.Load()), auth.KUID(d.uid.Load()))
 }
 
 // confinePath returns the path of d as the application sees it.
@@ -920,19 +981,60 @@ func (d *dentry) confinePath() string {
 		mode.FileType() == linux.ModeDirectory)
 }
 
-// checkChildConfinement evaluates confinement for an operation on the name
-// child within directory d, against the path that child has. Creating,
-// removing and renaming an entry are mediated by a rule for the entry's own
-// path, not by a write rule on the directory holding it.
-func (d *dentry) checkChildConfinement(creds *auth.Credentials, child string, ats vfs.AccessTypes) error {
+// checkChildCreateConfinement mediates creating the name child within directory
+// d. Creating a file asks for 'w' on the new file's own path; creating a hard
+// link asks for 'l' instead, which is what AppArmor's link rules are keyed on.
+// The link's target is then mediated by checkLinkConfinement().
+func (d *dentry) checkChildCreateConfinement(ctx context.Context, creds *auth.Credentials, op confine.Op, child string, isDir bool) error {
+	if op == confine.OpLink {
+		if !creds.Confined() {
+			return nil
+		}
+		return confine.CheckPerms(ctx, creds, op, d.childConfinePath(child), confine.Link, linux.FileMode(0), auth.KUID(creds.EffectiveKUID))
+	}
+	return d.checkChildConfinementDir(ctx, creds, op, child, vfs.MayWrite, isDir)
+}
+
+// checkLinkConfinement evaluates creating the link name within directory d to
+// the file at target: 'l' on the new name, a link rule naming the pair, and the
+// subset condition if that rule carries it.
+func (d *dentry) checkLinkConfinement(ctx context.Context, creds *auth.Credentials, name string, targetPath string, targetMode linux.FileMode, targetUID auth.KUID) error {
 	if !creds.Confined() {
 		return nil
 	}
+	return confine.CheckLink(ctx, creds, d.childConfinePath(name), targetPath, targetMode, targetUID)
+}
+
+// childConfinePath returns the path the name child within directory d has.
+func (d *dentry) childConfinePath(child string) string {
 	path := d.confinePath()
 	if !strings.HasSuffix(path, "/") {
 		path += "/"
 	}
-	return confine.Check(creds, path+child, ats, linux.FileMode(0), auth.KUID(creds.EffectiveKUID))
+	return path + child
+}
+
+// checkChildConfinement evaluates confinement for an operation on the name
+// child within directory d, against the path that child has. Creating,
+// removing and renaming an entry are mediated by a rule for the entry's own
+// path, not by a write rule on the directory holding it.
+func (d *dentry) checkChildConfinement(ctx context.Context, creds *auth.Credentials, op confine.Op, child string, ats vfs.AccessTypes) error {
+	return d.checkChildConfinementDir(ctx, creds, op, child, ats, false /* isDir */)
+}
+
+// checkChildConfinementDir is checkChildConfinement for an entry that is, or is
+// being created as, a directory. "When AppArmor looks up a directory the
+// pathname being looked up will end with a slash [...] Only rules that match a
+// trailing slash will match directories."
+func (d *dentry) checkChildConfinementDir(ctx context.Context, creds *auth.Credentials, op confine.Op, child string, ats vfs.AccessTypes, isDir bool) error {
+	if !creds.Confined() {
+		return nil
+	}
+	path := d.childConfinePath(child)
+	if isDir {
+		path += "/"
+	}
+	return confine.Check(ctx, creds, op, path, ats, linux.FileMode(0), auth.KUID(creds.EffectiveKUID))
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
@@ -1092,6 +1194,32 @@ func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return fs.setPosixACLLocked(ctx, fd.dentry(), auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), t, acl, clearSGID)
+}
+
+// LockBSD implements vfs.FileDescriptionImpl.LockBSD.
+func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
+	return fd.LockFD.LockBSD(ctx, uid, ownerPID, t, block)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
+	return fd.LockFD.LockPOSIX(ctx, uid, ownerPID, t, r, block)
+}
+
+// checkLockConfinement mediates locking the file, which AppArmor asks for
+// AA_MAY_LOCK for and 'k' grants.
+func (fd *fileDescription) checkLockConfinement(ctx context.Context) error {
+	creds := auth.CredentialsFromContext(ctx)
+	if creds == nil || !creds.Confined() {
+		return nil
+	}
+	return fd.dentry().checkLockConfinement(ctx, creds)
 }
 
 // IsCopiedUp returns true if the given vfs.Dentry is an overlayfs dentry that has

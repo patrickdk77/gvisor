@@ -381,9 +381,7 @@ func (d *attrData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 	if t == nil || t != d.task {
 		return 0, linuxerr.EACCES
 	}
-	if d.onExec {
-		return 0, linuxerr.EOPNOTSUPP
-	}
+
 	srclen := src.NumBytes()
 	if srclen > hostarch.PageSize {
 		return 0, linuxerr.EINVAL
@@ -396,6 +394,58 @@ func (d *attrData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 	// supported. Trailing NUL and newline are tolerated, as libapparmor
 	// may include either.
 	cmd := strings.TrimRight(string(buf), "\x00\n")
+	if d.onExec {
+		// aa_change_onexec(3) writes "exec <profile>" and
+		// aa_stack_onexec(3) writes "stack <profile>" here; the label is
+		// entered at the next execve(2).
+		if name, ok := strings.CutPrefix(cmd, "exec "); ok {
+			if err := t.SetConfinementOnExec(strings.TrimSpace(name), false /* stack */); err != nil {
+				return 0, err
+			}
+			return srclen, nil
+		}
+		if name, ok := strings.CutPrefix(cmd, "stack "); ok {
+			if err := t.SetConfinementOnExec(strings.TrimSpace(name), true /* stack */); err != nil {
+				return 0, err
+			}
+			return srclen, nil
+		}
+		return 0, linuxerr.EINVAL
+	}
+	if name, ok := strings.CutPrefix(cmd, "stack "); ok {
+		// aa_stack_profile(3).
+		if err := t.StackConfinementProfile(strings.TrimSpace(name)); err != nil {
+			return 0, err
+		}
+		return srclen, nil
+	}
+	if hats, token, ok := parseChangeHat(cmd); ok {
+		if len(hats) == 0 {
+			// aa_change_hat(3) with a NULL subprofile returns to the
+			// profile the hat was entered from.
+			switch err := t.LeaveConfinementHat(token); err {
+			case nil:
+				return srclen, nil
+			case kernel.ErrHatTokenMismatch:
+				// "the change back to the original profile will
+				// not happen, and the current task will be
+				// killed".
+				t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+				return 0, linuxerr.EACCES
+			default:
+				return 0, err
+			}
+		}
+		// aa_change_hatv(3) offers several hats; the first that exists
+		// is entered.
+		var err error
+		for _, hat := range hats {
+			if err = t.EnterConfinementHat(hat, token); err == nil {
+				return srclen, nil
+			}
+		}
+		return 0, err
+	}
 	const changeProfile = "changeprofile "
 	if !strings.HasPrefix(cmd, changeProfile) {
 		return 0, linuxerr.EINVAL
@@ -405,6 +455,33 @@ func (d *attrData) Write(ctx context.Context, _ *vfs.FileDescription, src userme
 		return 0, err
 	}
 	return srclen, nil
+}
+
+// parseChangeHat parses the command libapparmor writes for aa_change_hat(3),
+// "changehat <token>^<hat>", where the token is 16 hexadecimal digits.
+// aa_change_hatv(3) writes several hat names after the caret separated by NULs.
+// An empty hat list means the task is returning to the profile it entered from.
+func parseChangeHat(cmd string) ([]string, uint64, bool) {
+	const changeHat = "changehat "
+	rest, ok := strings.CutPrefix(cmd, changeHat)
+	if !ok {
+		return nil, 0, false
+	}
+	tokenStr, hats, ok := strings.Cut(rest, "^")
+	if !ok {
+		return nil, 0, false
+	}
+	token, err := strconv.ParseUint(strings.TrimSpace(tokenStr), 16, 64)
+	if err != nil {
+		return nil, 0, false
+	}
+	var out []string
+	for _, hat := range strings.Split(hats, "\x00") {
+		if hat != "" {
+			out = append(out, hat)
+		}
+	}
+	return out, token, true
 }
 
 // idMapData implements vfs.WritableDynamicBytesSource for

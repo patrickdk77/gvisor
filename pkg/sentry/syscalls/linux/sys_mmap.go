@@ -207,9 +207,34 @@ func Mremap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 
 // Mprotect implements linux syscall mprotect(2).
 func Mprotect(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	addr := args[0].Pointer()
 	length := args[1].Uint64()
 	prot := args[2].Int()
-	err := t.MemoryManager().MProtect(args[0].Pointer(), length, hostarch.AccessType{
+	// Adding PROT_EXEC to a file mapping is mediated by 'm', the same as
+	// mapping the file executable in the first place; otherwise a task could
+	// map a file readable, needing no 'm', and then make its contents
+	// executable. AppArmor's file_mprotect hook does the same. The check is
+	// before MProtect() applies anything, so a denial leaves the mapping
+	// unchanged, and it only runs for a confined task adding execute.
+	if linux.PROT_EXEC&prot != 0 && t.Credentials().Confined() {
+		if rlength, ok := hostarch.Addr(length).RoundUp(); ok {
+			if ar, ok := addr.RoundDown().ToRange(uint64(rlength)); ok {
+				files := t.MemoryManager().FileMappingsForExec(ar)
+				for _, file := range files {
+					if err := checkExecMappingConfinement(t, file); err != nil {
+						for _, f := range files {
+							f.DecRef(t)
+						}
+						return 0, nil, err
+					}
+				}
+				for _, file := range files {
+					file.DecRef(t)
+				}
+			}
+		}
+	}
+	err := t.MemoryManager().MProtect(addr, length, hostarch.AccessType{
 		Read:    linux.PROT_READ&prot != 0,
 		Write:   linux.PROT_WRITE&prot != 0,
 		Execute: linux.PROT_EXEC&prot != 0,
@@ -448,6 +473,15 @@ func checkMmapConfinement(t *kernel.Task, file *vfs.FileDescription, mayExec boo
 	if !mayExec || !creds.Confined() {
 		return nil
 	}
+	return checkExecMappingConfinement(t, file)
+}
+
+// checkExecMappingConfinement evaluates the 'm' permission for making file
+// executable in memory, whether by an executable mmap or by an mprotect that
+// adds PROT_EXEC. The caller has already established that the task is confined
+// and that execution is being requested.
+func checkExecMappingConfinement(t *kernel.Task, file *vfs.FileDescription) error {
+	creds := t.Credentials()
 	root := t.MountNamespace().Root(t)
 	defer root.DecRef(t)
 	vd := file.VirtualDentry()
@@ -467,6 +501,6 @@ func checkMmapConfinement(t *kernel.Task, file *vfs.FileDescription, mayExec boo
 	if err != nil {
 		return err
 	}
-	return confine.CheckPerms(creds, path, confine.Mmap,
+	return confine.CheckPerms(t, creds, confine.OpFmmap, path, confine.Mmap,
 		linux.FileMode(stat.Mode), auth.KUID(stat.UID))
 }

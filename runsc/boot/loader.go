@@ -261,6 +261,29 @@ type Loader struct {
 
 	hostTHP HostTHP
 
+	// appArmorAuditMu guards the audit sink fields below. They have a lock of
+	// their own, and it is a leaf: the descriptor must be released the moment
+	// the container's processes are gone, so that path must never queue behind
+	// mu, which is held across waits for those very processes to exit.
+	appArmorAuditMu sync.Mutex
+
+	// appArmorAuditFDs holds, per container, the sink its AppArmor audit
+	// records are written to.
+	//
+	// It is closed as soon as the container's processes have exited, and not
+	// at teardown: whatever drains the container's output stream waits for
+	// every writer to close before it sees EOF, and the runtime waits for
+	// that drain before it deletes the container. A descriptor that outlives
+	// the container's processes therefore makes the container unkillable,
+	// because the delete that would close it is exactly what is waiting.
+	// +checklocks:appArmorAuditMu
+	appArmorAuditFDs map[string]*auditSink
+
+	// appArmorAuditCID is the container whose stream the engine's single
+	// audit sink writes to.
+	// +checklocks:appArmorAuditMu
+	appArmorAuditCID string
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
@@ -1422,10 +1445,225 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+// setAppArmorAuditSink points the confinement engine at where
+// --apparmor-audit-target says audit records go. The container's own streams are
+// the default: a record is a fact about the workload, so it belongs where the
+// workload's other diagnostics are collected rather than in a per-node sentry
+// log.
+//
+// The descriptor it installs is released by watchAppArmorAuditSink() once the
+// container's processes exit, so every caller must pair this with that call or
+// with closeAppArmorAuditSink().
+func (l *Loader) setAppArmorAuditSink(info *containerInfo) {
+	// Nothing is mediated in the sandbox unless in-sandbox confinement is
+	// configured, so do not touch the container's streams at all in that
+	// case: holding a descriptor for a stream nothing will ever write to
+	// keeps the write end of the container's log pipe open, which is how a
+	// container ends up unkillable.
+	//
+	// This tests the configuration rather than whether a policy is loaded:
+	// with --apparmor-policy-source=container the policy is read further
+	// down, per container, so no policy exists yet at this point.
+	switch info.conf.AppArmorPolicySource {
+	case "host", "container":
+	default:
+		return
+	}
+	target := info.conf.AppArmorAuditTarget
+	if target == "" {
+		target = "stderr"
+	}
+	fd := -1
+	switch target {
+	case "stdout":
+		fd = 1
+	case "stderr":
+		fd = 2
+	case "gvisor":
+		confine.SetAuditSink(func(record string) {
+			log.Warningf("%s", record)
+		})
+		return
+	case "none":
+		confine.SetAuditSink(nil)
+		return
+	default:
+		log.Warningf("Invalid --apparmor-audit-target %q: want stderr, stdout, gvisor, or none; using stderr", target)
+		fd = 2
+	}
+	if len(info.stdioFDs) <= fd {
+		log.Warningf("AppArmor: the container has no fd %d, so audit records go to the sentry log instead", fd)
+		confine.SetAuditSink(func(record string) {
+			log.Warningf("%s", record)
+		})
+		return
+	}
+	// The descriptor is duplicated because stdioFDs are donated to the
+	// container's FD table below and closed with it. The duplicate lives
+	// exactly as long as the container's own processes do; see
+	// watchAppArmorAuditSink().
+	dup, err := unix.Dup(info.stdioFDs[fd].FD())
+	if err != nil {
+		log.Warningf("AppArmor: audit records will not appear on the container's fd %d: %v", fd, err)
+		return
+	}
+	sink := newAuditSink(dup)
+	l.appArmorAuditMu.Lock()
+	defer l.appArmorAuditMu.Unlock()
+	if l.appArmorAuditFDs == nil {
+		l.appArmorAuditFDs = make(map[string]*auditSink)
+	}
+	if old, ok := l.appArmorAuditFDs[info.cid]; ok {
+		old.close()
+	}
+	l.appArmorAuditFDs[info.cid] = sink
+	if l.appArmorAuditCID != "" && l.appArmorAuditCID != info.cid {
+		// The engine holds one sink, so records from every container in
+		// the sandbox land on this one's stream from here on.
+		log.Warningf("AppArmor: audit records for all containers now go to container %s; the engine keeps one sink", info.cid)
+	}
+	l.appArmorAuditCID = info.cid
+	confine.SetAuditSink(sink.write)
+}
+
+// auditSink owns the descriptor AppArmor audit records for one container are
+// written to.
+//
+// Writing and closing must not race on the descriptor number. Once it is
+// closed the number is free to be reused, so a task that was about to write a
+// record would put that record into whichever descriptor took the number: a
+// different container's output stream, or a file the sandbox has open. The lock
+// prevents it. It is read-held for the write, which never blocks, so records
+// from different tasks still proceed concurrently, and taking it cannot delay a
+// task behind anything but a close.
+type auditSink struct {
+	mu sync.RWMutex
+
+	// fd is the descriptor records are written to, or -1 once closed.
+	//
+	// +checklocks:mu
+	fd int
+}
+
+// newAuditSink returns a sink that writes audit records to fd, which it owns
+// from then on.
+//
+// The records are appended, so that they interleave with the workload's own
+// output rather than overwriting it where the stream is a regular file and the
+// two do not share a file offset. They are written without blocking: a record is
+// a diagnostic, and a task must never wait on whoever is draining the
+// container's output, because it is holding filesystem locks and the operation
+// it is mediating cannot finish until the write does. A record that cannot be
+// written is dropped.
+func newAuditSink(fd int) *auditSink {
+	if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err != nil {
+		log.Warningf("AppArmor: cannot read the flags of fd %d: %v", fd, err)
+	} else if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags|unix.O_APPEND|unix.O_NONBLOCK); err != nil {
+		log.Warningf("AppArmor: cannot write records to fd %d without blocking: %v", fd, err)
+	}
+	return &auditSink{fd: fd}
+}
+
+// write emits one record. It is the function the confinement engine calls.
+func (s *auditSink) write(record string) {
+	b := make([]byte, 0, len(record)+1)
+	b = append(b, record...)
+	b = append(b, '\n')
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.fd < 0 {
+		// The container's processes are gone, so nothing is left to report
+		// about and the stream may already belong to someone else.
+		return
+	}
+	// A short write, EAGAIN from a full pipe, and EPIPE from a reader that
+	// has gone away all drop the record rather than delay the task that
+	// produced it.
+	unix.Write(s.fd, b)
+}
+
+// close releases the descriptor, waiting for any record already being written.
+// It is idempotent.
+func (s *auditSink) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fd < 0 {
+		return
+	}
+	unix.Close(s.fd)
+	s.fd = -1
+}
+
+// watchAppArmorAuditSink releases the descriptor audit records for cid are
+// written to once the container's processes have exited.
+//
+// The descriptor must not outlive them. It is a writer of one of the
+// container's output streams, and the runtime stops a container by waiting for
+// that stream to drain, which cannot happen until every writer is closed. The
+// delete that used to close this descriptor runs only after that wait
+// completes, so releasing it at teardown made the container unkillable: the
+// runtime waited for the sentry, and the sentry waited to be told to delete.
+//
+// A container's processes exiting is the same event the runtime is waiting for,
+// so hooking the release to it keeps the descriptor for exactly as long as
+// there is something left to audit and not an instant longer.
+//
+// waitExited blocks until the container's processes have exited; it is
+// ThreadGroup.WaitExited in the sandbox.
+func (l *Loader) watchAppArmorAuditSink(cid string, waitExited func()) {
+	l.appArmorAuditMu.Lock()
+	_, ok := l.appArmorAuditFDs[cid]
+	l.appArmorAuditMu.Unlock()
+	if !ok {
+		// No stream is held for this container: either confinement is off,
+		// or records go to the sentry log, or the duplicate failed.
+		return
+	}
+	go func() {
+		waitExited()
+		l.closeAppArmorAuditSink(cid)
+	}()
+}
+
+// closeAppArmorAuditSink closes the descriptor audit records for cid were
+// written to, so that the container's output stream has no writer left once its
+// processes are gone. It is idempotent.
+func (l *Loader) closeAppArmorAuditSink(cid string) {
+	l.appArmorAuditMu.Lock()
+	defer l.appArmorAuditMu.Unlock()
+	sink, ok := l.appArmorAuditFDs[cid]
+	if !ok {
+		return
+	}
+	// Only the container whose stream the engine is writing to may take the
+	// sink away; another container's teardown must not silence it.
+	if l.appArmorAuditCID == cid {
+		confine.SetAuditSink(nil)
+		l.appArmorAuditCID = ""
+	}
+	// Any record already being written finishes first, so no record can land
+	// in whatever descriptor next takes this number.
+	sink.close()
+	delete(l.appArmorAuditFDs, cid)
+}
+
 // +checklocks:l.mu
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
+	// Install the sink AppArmor audit records go to, before any task runs.
+	l.setAppArmorAuditSink(info)
+	// The sink holds a writer of one of the container's output streams, which
+	// must be released when the container's processes exit. A container that
+	// fails to start here has no processes to wait for, so release it now
+	// rather than leaving a writer on a stream nothing will ever write to.
+	started := false
+	defer func() {
+		if !started {
+			l.closeAppArmorAuditSink(info.cid)
+		}
+	}()
+
 	fdTable, ttyFile, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User, info.containerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("importing fds: %w", err)
@@ -1545,6 +1783,10 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 		}
 	}
 
+	// The container has processes now, so the audit sink's descriptor is
+	// released when they exit rather than by the deferred cleanup above.
+	l.watchAppArmorAuditSink(info.cid, tg.WaitExited)
+	started = true
 	return tg, ttyFile, nil
 }
 
@@ -1635,6 +1877,9 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	}
 	// Cleanup the device gofer.
 	l.k.RemoveDevGofer(l.k.ContainerName(cid))
+	// Normally released when the container's processes exited, well before
+	// teardown; this covers a container that never started one.
+	l.closeAppArmorAuditSink(cid)
 
 	if l.root.conf.MountCgroupV2 {
 		l.removeContainerCgroup2(cid)

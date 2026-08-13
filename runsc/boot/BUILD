@@ -168,14 +168,20 @@ go_library(
 
 go_test(
     name = "boot_test",
-    size = "small",
+    size = "medium",
     srcs = [
+        "apparmor_reference_test.go",
+        "apparmor_behavior_test.go",
         "apparmor_test.go",
         "compat_test.go",
         "loader_test.go",
         "mount_hints_test.go",
         "vfs_test.go",
     ],
+    data = [
+        "testdata/apparmor_behavior.tsv",
+        "testdata/gvisor_behav.aa",
+        "testdata/gvisor_behav2.aa","testdata/apparmor_reference.tsv"],
     library = ":boot",
     deps = [
         "//pkg/sentry/confine",

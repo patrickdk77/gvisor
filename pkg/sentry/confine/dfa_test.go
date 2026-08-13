@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -127,10 +128,10 @@ func TestDFAFallsBackWhenFull(t *testing.T) {
 	SetPolicy(map[string]*Profile{"p": p})
 	defer SetPolicy(nil)
 	p.dfa.markFullForTest()
-	if err := p.checkLinear("/etc/passwd", Read, false); err != nil {
+	if err := p.checkLinear(auth.NewAnonymousCredentials(), &Record{Op: OpFperm, Name: "/etc/passwd", Requested: Read}, false); err != nil {
 		t.Errorf("checkLinear(/etc/passwd, Read) = %v, want nil", err)
 	}
-	if err := p.checkLinear("/etc/shadow", Read, false); err == nil {
+	if err := p.checkLinear(auth.NewAnonymousCredentials(), &Record{Op: OpFperm, Name: "/etc/shadow", Requested: Read}, false); err == nil {
 		t.Error("checkLinear(/etc/shadow, Read) = nil, want a denial")
 	}
 }

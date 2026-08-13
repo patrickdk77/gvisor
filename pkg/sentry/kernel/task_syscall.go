@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -330,6 +331,7 @@ func (t *Task) doSyscallInvoke(sysno uintptr, args arch.SyscallArguments) taskRu
 			return ctrl.next
 		}
 	} else if err != nil {
+		t.confinementKill(sysno, err)
 		t.Arch().SetReturn(uintptr(-ExtractErrno(err, int(sysno))))
 		t.haveSyscallReturn = true
 	} else {
@@ -337,6 +339,28 @@ func (t *Task) doSyscallInvoke(sysno uintptr, args arch.SyscallArguments) taskRu
 	}
 
 	return (*runSyscallExit)(nil).execute(t)
+}
+
+// confinementKill signals the task if err is a violation of an AppArmor profile
+// in kill mode, which is enforce mode plus signal termination. The signal is
+// sent to the offending task, as Linux's apparmor does, and the syscall still
+// returns the denial to the caller; the signal is delivered before the task
+// resumes in userspace. Any other error is left alone.
+func (t *Task) confinementKill(sysno uintptr, err error) {
+	kill, ok := confine.AsKillError(err)
+	if !ok {
+		return
+	}
+	sig := linux.Signal(kill.Signal)
+	if sig == 0 {
+		sig = linux.SIGKILL
+	}
+	// The denial itself has already been reported to the container; only a
+	// failure to deliver the signal, which would be a bug here, is worth a
+	// line in the sentry log.
+	if err := t.SendSignal(SignalInfoPriv(sig)); err != nil {
+		t.Warningf("Failed to kill task for AppArmor violation of a profile in kill mode: %v", err)
+	}
 }
 
 // +stateify savable
@@ -488,11 +512,25 @@ func ExtractErrno(err error, sysno int) int {
 		return ExtractErrno(err.Err, sysno)
 	case *os.SyscallError:
 		return ExtractErrno(err.Err, sysno)
+	case *confine.KillError:
+		// A violation of an AppArmor profile in kill mode reports the same
+		// errno as the same violation in enforce mode; the signal is a
+		// separate effect, delivered by confinementKill(). Without this the
+		// error reaches the panic below, because it is a type of this
+		// package's own rather than one linuxerr knows how to translate,
+		// and every kill-mode denial would panic the sentry.
+		return ExtractErrno(err.Err, sysno)
 	case *platform.ContextError:
 		return int(err.Errno)
 	default:
 		if errno, ok := linuxerr.TranslateError(err); ok {
 			return int(linuxerr.ToUnix(errno))
+		}
+		// A kill-mode violation that arrives wrapped is not matched by the
+		// case above. Checked here rather than before the switch so that the
+		// common failing syscall pays nothing for it.
+		if kill, ok := confine.AsKillError(err); ok {
+			return ExtractErrno(kill.Err, sysno)
 		}
 	}
 	panic(fmt.Sprintf("Unknown syscall %d error: %v", sysno, err))

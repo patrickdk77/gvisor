@@ -161,6 +161,7 @@ go_test(
     name = "tmpfs_test",
     size = "small",
     srcs = [
+        "confine_bench_test.go",
         "confine_test.go",
         "pipe_test.go",
         "regular_file_test.go",

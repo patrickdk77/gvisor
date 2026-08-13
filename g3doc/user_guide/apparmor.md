@@ -124,9 +124,66 @@ quietly reduced to something weaker than it appears. Check that list against a
 profile before trusting it; enforce what is missing with `--host-apparmor` on
 the Sentry and Gofer.
 
-A profile declared `flags=(complain)` logs what it would have denied and permits
-it, as it does on a host kernel, so a profile can be developed against a real
-workload before it is switched to enforcing.
+A profile's `flags=(...)` select what a denial does:
+
+| flag | effect |
+| --- | --- |
+| `enforce` | deny the access. The default. |
+| `complain` | permit the access and log what would have been denied, as on a host kernel, so a profile can be developed against a real workload before it is switched to enforcing |
+| `kill` | deny the access *and* signal the offending task, which is how a profile makes a violation fatal instead of something an application can retry around. As on a host kernel, this follows auditing: a denial silenced by a plain `deny` rule denies without killing, while one with no matching rule, one from an `audit deny` rule, or any denial in a profile also flagged `audit` kills |
+| `kill.signal=<sig>` | the signal `kill` sends, `SIGKILL` if unset. It is sent to the task that made the access, as Linux's AppArmor does, so the syscall still returns the denial and the signal is delivered before the task resumes |
+| `default_allow` | permit anything no `deny` rule refuses, inverting the profile |
+| `unconfined` | mediate nothing inside the sandbox |
+| `error=<errno>` | the errno a denial returns instead of `EACCES` |
+| `audit` | log every access the profile mediates, not only denials |
+
+`complain` wins over `kill` where a profile carries both, so raising a profile's
+flags never turns a development run fatal. These flags select one mode between
+them, so a profile naming several takes the last.
+
+### Audit records
+
+A mediated access is reported in the format Linux's AppArmor produces. Records
+go to the container's standard error by default, which is where a cluster's log
+collection already reads a workload's diagnostics from and does not require
+logging in to the node:
+
+```toml
+[runsc_config]
+  apparmor-audit-target = "stderr"   # stderr (default), stdout, gvisor, or none
+```
+
+`stdout` writes them to the container's other stream, `gvisor` to the sentry log
+(`gvisor.log`) for an operator who collects that instead, and `none` discards
+them, which leaves enforcement on and reporting off.
+
+```
+apparmor="DENIED" operation="open" class="file" profile="docker-hosted" name="/etc/shadow" requested_mask="r" denied_mask="r" fsuid=33 ouid=0 error=-13
+```
+
+The fields and their order are `aa_audit_msg()`'s and `file_audit_cb()`'s, so
+the tools that already parse AppArmor records read these: libapparmor's
+`aa_parse_record`, and `aa-logprof` and `aa-genprof` on top of it.
+
+*   `apparmor=` is `DENIED` for a refused access, `KILLED` when a `kill` profile
+    also signals the task, `ALLOWED` for one a `complain` profile permitted, and
+    `AUDIT` for one an `audit` rule or an `audit` profile permitted.
+*   `operation=` is Linux's own name for the operation: `open`, `getattr`,
+    `setattr`, `chmod`, `chown`, `truncate`, `create`, `mkdir`, `rmdir`,
+    `mknod`, `symlink`, `unlink`, `link`, `rename_src`, `rename_dest`,
+    `file_lock`, `file_mmap`, `exec`, `change_profile`, `change_onexec`,
+    `change_hat`, or `file_perm` for a check that is none of those.
+*   `name=` is the path, and `target=` the second one an operation has: the file
+    a link points at, or the profile an exec or `change_profile` moves to.
+*   `requested_mask=` and `denied_mask=` are permission characters.
+*   `fsuid=` is the accessing task's UID, which `owner` rules compare against,
+    and `ouid=` the file's owner. A denial of an `owner` rule is the case where
+    the two differ.
+*   `error=` is the negated errno the syscall returned, which `error=` in the
+    profile's flags can change.
+
+`pid=` and `comm=` are absent, since the engine is reached with a task's
+credentials rather than the task.
 
 ### Entering a profile
 
@@ -140,14 +197,35 @@ deny every access it makes. A process exec'd into a running container starts in
 the same profile as that container's initial process, so `kubectl exec` is not a
 way around it.
 
-From there an application enters a different profile in either of the two ways
-it would on a host kernel:
+From there an application enters a different profile in any of the ways it would
+on a host kernel:
 
 *   **`aa_change_profile(3)`**, which writes `changeprofile <name>` to
     `/proc/self/attr/current`. Apache's `suexec`, for instance, calls this
     before `execve` so each CGI process is confined. The Sentry implements this
     interface; as in Linux, a task may only write its own attributes, and the
-    target must be one the current profile's `change_profile` rules permit.
+    target must be one the current profile's `change_profile` rules permit. A
+    `deny change_profile` rule refuses a target the profile would otherwise
+    allow, and a rule carrying an exec condition
+    (`change_profile /bin/foo -> bar`) permits the target only on exec of a
+    matching path, not on a bare `changeprofile` write.
+
+*   **`aa_change_onexec(3)`** (`stack`- and `exec`-prefixed writes to
+    `/proc/self/attr/exec`), which arms a transition that takes effect at the
+    next `execve` instead of immediately. The target is checked against the
+    `change_profile` rules when it is armed and again when it is applied.
+
+*   **`aa_change_hat(3)`**, which writes `changehat <token>^<hat>` to
+    `/proc/self/attr/current` and enters a hat declared in the current profile
+    (`^upload { ... }`). Writing the same magic token with an empty hat name
+    returns to the profile; a wrong token is a violation, as on a host kernel.
+    `aa_change_hatv(3)`'s list of candidate hats is supported, and the first
+    one the profile declares is entered.
+
+*   **stacking**, either `aa_change_profile(3)`'s `stack <name>` form or a
+    `//&`-joined label. Every profile in a stacked label must permit an access,
+    so a stack grants the intersection of its profiles and can only narrow what
+    a task may do.
 
 *   **exec**, where the transition is decided by the exec rules of the profile
     in force, as it is on a host kernel:
@@ -161,8 +239,10 @@ it would on a host kernel:
     | `ux`, `Ux` | run unconfined |
 
     Where several rules match, the most specific pattern wins, so a rule for one
-    path overrides the catch-all that `file,` produces. `Px` and `Cx` also scrub
-    the environment on a host kernel; that is not distinguished here.
+    path overrides the catch-all that `file,` produces. The uppercase forms
+    (`Px`, `Cx`, `Ux`) scrub the environment, as they do on a host kernel: the
+    exec is treated as a privilege-gaining one, so the loader strips
+    `LD_PRELOAD` and its siblings the same way it does for a setuid binary.
 
 Confinement is per task and lives in the task's credentials, so it is inherited
 across `fork` and preserved across `execve`, including the setuid exec that
@@ -171,8 +251,10 @@ defines: the targets of its `change_profile` rules, and the transitions of its
 exec rules. The single way to leave confinement is a `ux` or `Ux` exec rule,
 which the profile has to ask for explicitly; it is logged when it happens.
 
-`aa_change_onexec(3)` (`/proc/self/attr/exec`) is not implemented; writes fail
-with `EOPNOTSUPP` rather than leaving the task silently unconfined.
+A profile may also be attached by the path of the executable that enters it
+(`profile /usr/sbin/httpd { ... }`, or the named form
+`profile web /usr/sbin/httpd { ... }`), which is how a bare `x` rule finds the
+profile to transition into.
 
 ### Host or container profiles
 
@@ -224,14 +306,114 @@ can set for itself.
 The `file` rule class is supported in both forms: bare `file,` is every access
 to every path, and `file /p rw,` is the same rule as `/p rw,`.
 
-Of the permission characters, `r`, `w` and `x` are mediated on file accesses,
-and `m` is mediated on executable mappings, so that a task denied `x` on a file
-it can write cannot run the file's contents by mapping them instead. `a` is
-accepted and, as on a host kernel, is implied by `w`, but an append-only rule is
-not distinguished from a writable one.
+Every permission character of the `file` rule class is mediated:
+
+| character | what it permits |
+| --- | --- |
+| `r` | reading a file, and listing a directory |
+| `w` | writing a file, and creating, deleting or renaming a path |
+| `a` | appending to a file: an `O_APPEND` open. It is mutually exclusive with `w`, as on a host kernel, so a rule granting `a` does not grant a truncating or seeking write |
+| `x` | executing a file, with the transition its modifier selects |
+| `m` | mapping a file executably. A read-only or non-executable mapping does not need it, so `m` is what stops a task denied `x` from running a file's contents by mapping them instead |
+| `l` | linking, as a link and target pair. `l` on the link is required, then a link rule naming the pair, and if that rule carries the `subset` condition, the link's permissions must be a subset of the target's. A bare `l` is itself such a rule, with subset implied and a target of `/**`, which is the equivalence the man page gives |
+| `k` | locking, checked on `flock` and POSIX record locks |
+
+The `owner` conditional restricts a rule to files whose UID matches the task's,
+`deny` refuses what a broader rule would allow, and `audit` logs what a rule
+permits.
+
+Which permission an operation asks for follows Linux's own hooks:
+
+| operation | permission |
+| --- | --- |
+| open | `r`, `w`, `x`, `m` as the flags ask for; `a` in place of `w` for `O_APPEND`, and `w` again for `O_TRUNC` |
+| create, delete, rename | `w` on the entry's own path, not on the directory holding it. This includes creating a file with `O_CREAT`, which asks for `w` on the file being created |
+| `chmod`, `chown`, `truncate`, `utimes` | `w`, which is what grants `AA_MAY_SETATTR`, `AA_MAY_CHMOD` and `AA_MAY_CHOWN` |
+| `flock`, POSIX locks | `k` |
+| executable `mmap`, and `mprotect` adding `PROT_EXEC` to a file mapping | `m`. A task cannot map a file without `PROT_EXEC`, needing no `m`, and then `mprotect` its contents executable |
+| hard link | `l` on the new link, plus a link rule for the pair. Note `l` and not `w`: a profile grants a link by naming it in a link rule, not by making the path writable |
+
+#### Pattern matching
+
+Patterns are matched as `apparmor_parser` compiles them, not as the prose in
+apparmor.d(5) reads. Three of its rules are easy to get wrong, and each one was:
+
+*   A wildcard that is a **whole path component** matches at least one
+    character. `apparmor_parser` compiles `/dir/*` to
+    `/dir/[^/\x00][^/\x00]*` and `/dir/**` to `/dir/[^/\x00][^\x00]*`, so
+    neither covers `/dir/` itself, and `/dir/**` does not match `/dir//sub`. A
+    rule for the directory is written with the trailing slash.
+*   A wildcard that is **part** of a component may match nothing: `*.php`
+    compiles to `[^/\x00]*\.php`, which matches `.php`.
+*   A wildcard **inside a brace alternation** is bare, with no minimum, wherever
+    it sits: `/dir/{,**}` compiles to `/dir/(|[^\x00]*)`.
+*   A **character class matches `/`**. Only `?` and `*` are confined to one
+    component; `[^b]` compiles to `[^b]`, with no separator exclusion. This
+    matters most in a deny rule: `deny @{PROC}/{[^1-9],[^1-9][^0-9][^0-9][^0-9]*}/** w`
+    relies on a negated class spanning components, and a class that refused `/`
+    would deny less than a host kernel does.
+
+These are not asserted from reading; they are checked against the parser itself.
+`pkg/sentry/confine/testdata/aare_reference.tsv` and
+`runsc/boot/testdata/apparmor_reference.tsv` hold, for each pattern of a real
+multi-tenant profile set, the regexp `apparmor_parser` compiles it to, captured
+with:
+
+```
+apparmor_parser -QT --dump=rule-exprs <profile>
+```
+
+The tests over that data compare both the rule walk and the compiled automaton
+against those regexps over a derived path corpus, including the empty-wildcard
+case. Regenerate the data the same way when adding patterns; a disagreement means
+a rule covers a different set of paths here than it does on a host kernel.
+
+`access(2)` and `readlink(2)` are not in that table because Linux's AppArmor
+does not hook them: it registers no `inode_permission`, `inode_readlink` or
+`path_readlink` hook, so neither is a mediated operation, and requiring a
+permission for either would deny what a host kernel permits. Reading a symlink
+is therefore not mediated; the access it leads to is.
+
+`stat(2)` and `lstat(2)` are not mediated either, and that is a deliberate
+finding rather than an oversight. Linux registers an `inode_getattr` hook, so the
+code exists to mediate them, but a real kernel does not deny a stat of a path
+that no rule in the profile matches: with a production profile whose 487 compiled
+rules contain nothing for the path,
+
+```
+aa-exec -p cageweb -- stat /var/www/vhosts/s/t/<site>
+```
+
+succeeds and audits nothing, and that profile has run for fifteen years without
+producing such a denial. Mediating it here denied what a host kernel permits,
+which broke a live workload; the mechanism by which the kernel permits it has not
+been located in the source, so this is recorded as an unexplained difference
+rather than a claim. If you need it, establish first what a host kernel actually
+does with your profile.
+
+A profile that wants to silence expected denials of the operations that *are*
+mediated does it the way AppArmor intends, with a deny rule, which denies
+"without logging":
+
+```
+  deny @{WWW_DIRS}/?/?/?* r,
+  deny @{WWW_DIRS}/?/?/?*/ r,
+```
+
+Note `?*` rather than `*`: AARE's `*` matches the empty string too, so
+`deny <dir>/* r,` also denies `<dir>` itself and breaks the listing the rule was
+meant to keep working. The second rule is for the directory form of the path,
+since a directory is matched with a trailing slash.
+
+A directory is matched with a trailing slash, as AppArmor does it: "when
+AppArmor looks up a directory the pathname being looked up will end with a
+slash", so `mkdir /srv/x` is mediated as `/srv/x/` and only a rule ending in a
+slash matches it.
 
 Enforcement covers the mounts the Sentry serves from a Gofer, the overlays
-layered on them, `erofs` image mounts, and `tmpfs` mounts. That includes the
+layered on them, `erofs` image mounts, and `tmpfs` mounts.
+
+That includes the
 container's root filesystem, whether it is a Gofer mount, an overlay over one,
 or an EROFS image, which is where a setuid binary shipped in the image would
 live.
@@ -257,36 +439,33 @@ no path to match a rule against. In practice the DAC mode bits still apply, and
 gVisor's `/proc` and `/sys` expose far less than a host kernel's; `hidepid` is
 the setting that limits what a user sees of other processes.
 
-**Permissions.** `l` and `k` are parsed and ignored: creating a link still
-requires `w` on the containing directory, and locking still requires the access
-the file was opened with. `a` does not restrict a rule to appending.
+**Operations.** Three of the hooks Linux registers have no counterpart here:
 
-**Operations.** Extended attributes are not mediated, so `SetXattrAt` and its
-siblings ignore the profile entirely. Deleting or renaming a file is mediated by
-`w` on its *directory*, not by a rule on the file's own path as AppArmor does,
-so a profile that grants `w` on a directory but not on a file within it will
-still permit that file's removal.
+*   `file_permission`, which re-checks a read or write through an already-open
+    file description when the task's label has changed since the open. A task
+    that changes profile therefore keeps the file descriptions it opened under
+    the old one.
+*   `file_receive`, which mediates a file description passed over a unix socket
+    against the receiving profile.
+Extended attributes are *not* in that list: Linux's AppArmor registers no
+`inode_getxattr`, `inode_setxattr`, `inode_listxattr` or `inode_removexattr`
+hook, so leaving them unmediated is what a host kernel does.
 
-**Rule classes.** Only file rules and `change_profile` are derived from a
-profile. `network`, `capability`, `mount`, `umount`, `pivot_root`, `ptrace`,
-`signal`, `unix`, `dbus` and `rlimit` rules are not enforced in-sandbox; they
-are logged at startup and must be enforced on the Sentry and Gofer with
-`--host-apparmor`. `abi` declarations are ignored, and a rule that spans several
-lines (`dbus` rules typically do) has each of its lines reported separately. A
-`deny change_profile` rule carrying an exec condition
-(`deny change_profile /bin/foo -> bar`) is reported as unenforced rather than
-applied to every exec, which would deny more than the profile says.
+**Rule classes.** Only `file` rules, `link` rules and `change_profile` are
+derived from a profile. `network`, `capability`, `mount`, `umount`,
+`pivot_root`, `ptrace`, `signal`, `unix`, `dbus`, `rlimit` and `userns` rules
+are not enforced in-sandbox; they are logged at startup and must be enforced on
+the Sentry and Gofer with `--host-apparmor`. `abi` declarations are ignored, and
+a rule that spans several lines (`dbus` rules typically do) has each of its
+lines reported separately.
 
-**Profile flags.** Only `complain` is acted on. `attach_disconnected`,
-`mediate_deleted`, `chroot_relative` and the rest are accepted and ignored,
-because the Sentry builds the path from the dentry chain rather than from a host
-`d_path` call, so the conditions those flags exist to handle do not arise the
-same way.
-
-**Transitions.** Profile stacking, hats (`change_hat`), `aa_change_onexec(3)`,
-and named profile attachment (`profile foo /path { ... }`, as opposed to
-`profile /path { ... }`) are not implemented. The environment is not scrubbed for
-`Px` or `Cx`.
+**Profile flags.** `prompt`, `attach_disconnected`, `attach_disconnected.path=`,
+`mediate_deleted`, `chroot_relative`, `debug` and `interruptible` are accepted
+and ignored. The path ones do not translate: the Sentry builds the path from the
+dentry chain rather than from a host `d_path` call, so the conditions those
+flags exist to handle do not arise the same way. `prompt` has no counterpart
+because there is no userspace agent inside the sandbox to answer a prompt, and
+it degrades to `enforce` rather than to `complain`.
 
 **Scoping.** Every profile in the policy directory is loaded into one set shared
 by the whole sandbox, and with `--apparmor-policy-source=container` the sets of
@@ -294,10 +473,11 @@ every container are merged into it. The set is not scoped to what a given
 container can reach, so a task may change to any profile its `change_profile`
 rules match, including one a different container in the pod contributed.
 
-**Auditing.** Denials are logged to the sandbox log, not to the host audit
-subsystem, so `dmesg | grep DENIED` will not show them and neither will
-`aa-notify`. The `audit` qualifier on a rule is accepted and has no additional
-effect.
+**Auditing.** Records go where `--apparmor-audit-target` says rather than to the
+host audit subsystem, so `dmesg | grep DENIED` will not show them and neither
+will `aa-notify`, which reads the audit socket. They carry no `pid` or `comm`
+field: the engine is reached with the accessing task's credentials rather than
+the task itself.
 
 ### Differences from host AppArmor
 

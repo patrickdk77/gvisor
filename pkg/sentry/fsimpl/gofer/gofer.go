@@ -1634,13 +1634,15 @@ func (i *inode) updateSizeAndUnlockDataMuLocked(newSize uint64) {
 	}
 }
 
-func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+func (d *dentry) checkPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	if err := vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.inode.mode.Load()), nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load())); err != nil {
 		return err
 	}
 	// Evaluate the AppArmor profile the task has entered, if any; see
-	// confine.go.
-	return d.checkDentryConfinement(creds, ats)
+	// confine.go. The operation is the generic one: a caller that mediates a
+	// specific operation names it, and the rest are permission checks on a
+	// path, which is what Linux's file_perm is.
+	return d.checkDentryConfinement(ctx, creds, confine.OpFperm, ats)
 }
 
 // Preconditions: d.inode.metadataMu must be locked.
@@ -2489,10 +2491,7 @@ func (fd *fileDescription) checkLockConfinement(ctx context.Context) error {
 	if creds == nil || !creds.Confined() {
 		return nil
 	}
-	d := fd.dentry()
-	mode := linux.FileMode(d.inode.mode.Load())
-	return confine.CheckPerms(creds, d.confinePath(), confine.Lock, mode,
-		auth.KUID(d.inode.uid.Load()))
+	return fd.dentry().checkLockConfinement(ctx, creds)
 }
 
 func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {

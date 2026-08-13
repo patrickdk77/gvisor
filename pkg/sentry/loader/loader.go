@@ -335,7 +335,17 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	// "px" enters a named profile, "ux" runs unconfined. An unconfined task
 	// enters the profile named after the executable, if there is one.
 	// c is already a private copy; see auth.ComputeCredsForExec().
-	newProfile, scrubEnv, err := confine.TransitionOnExec(c.ConfinementProfile, execPath)
+	if onExec := c.OnExecProfile; onExec != "" {
+		// aa_change_onexec(3) requested this label at the next exec. The
+		// change_profile rules of the profile in force decide it, and an
+		// exec condition on those rules is evaluated against this exec.
+		if err := confine.CheckChangeProfileOnExec(ctx, c.ConfinementProfile, onExec, execPath); err != nil {
+			return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to enter the AppArmor profile requested for exec of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
+		}
+		c.ConfinementProfile = onExec
+		c.OnExecProfile = ""
+	}
+	newProfile, scrubEnv, err := confine.TransitionOnExec(ctx, c.ConfinementProfile, execPath)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to enter an AppArmor profile for %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}

@@ -262,6 +262,7 @@ go_library(
         "cgroup_mounts_mutex.go",
         "cgroup_mutex.go",
         "cgroup_v2_mutex.go",
+        "confine_audit.go",
         "context.go",
         "fd_table.go",
         "fd_table_mutex.go",
@@ -445,6 +446,7 @@ go_test(
     srcs = [
         "fd_table_test.go",
         "table_test.go",
+        "task_syscall_test.go",
         "task_test.go",
         "timekeeper_test.go",
     ],
@@ -453,6 +455,7 @@ go_test(
         "//pkg/abi",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/sentry/confine",
         "//pkg/hostarch",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",

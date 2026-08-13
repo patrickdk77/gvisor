@@ -1,0 +1,17 @@
+abi <abi/3.0>,
+profile gvisor-behav {
+  # Enough to run python3.
+  /usr/** rmix,
+  /lib/** rm,
+  /lib64/** rm,
+  /etc/** r,
+  /dev/null rw,
+  /proc/** r,
+
+  # The semantics under test.
+  /tmp/aa-behav/** r,
+  deny /tmp/aa-behav/denied/** r,
+  owner /tmp/aa-behav/owned/* rw,
+  audit /tmp/aa-behav/audited/* r,
+  /tmp/aa-behav/exact rw,
+}

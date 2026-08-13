@@ -36,7 +36,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -128,15 +127,19 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		return nil, nil, fmt.Errorf("failed to start gofer: %w", err)
 	}
 
-	// Loader takes ownership of stdio.
+	// Loader takes ownership of stdio. Open /dev/null rather than duplicating
+	// this process's descriptors: a test binary is not guaranteed to have all
+	// three standard descriptors open, duplicating a closed one fails with
+	// EBADF, and the Loader is then left half-started, which the watchdog
+	// reports as a stall instead of the test failing. Nothing here reads the
+	// sandbox's output, so somewhere to send it is all that is required.
 	var stdio []int
-	for _, f := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
-		fd := int(f.Fd())
-		newFd, err := unix.Dup(fd)
+	for i, flags := range []int{unix.O_RDONLY, unix.O_WRONLY, unix.O_WRONLY} {
+		fd, err := unix.Open(os.DevNull, flags, 0)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to dup FD %d: %w", fd, err)
+			return nil, nil, fmt.Errorf("opening %s for the sandbox's stdio %d: %w", os.DevNull, i, err)
 		}
-		stdio = append(stdio, newFd)
+		stdio = append(stdio, fd)
 	}
 
 	args := Args{
@@ -167,28 +170,66 @@ func TestRun(t *testing.T) {
 		t.Fatalf("error creating loader: %v", err)
 	}
 
-	defer l.Destroy()
+	// Destroy waits for the loader, so if Run() is wedged the deferred
+	// Destroy wedges too and the failed test becomes a binary timeout with
+	// the failure message lost. Bound it: on timeout the loader leaks, which
+	// a failing test can afford.
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			l.Destroy()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Log("Loader.Destroy() did not return within 30s; leaking the loader")
+		}
+	}()
 	defer cleanup()
 
 	// Start a goroutine to read the start chan result, otherwise Run will
 	// block forever.
-	var resultChanErr error
-	var wg sync.WaitGroup
-	wg.Add(1)
+	resultChan := make(chan error, 1)
 	go func() {
-		resultChanErr = <-l.ctrl.manager.startResultChan
-		wg.Done()
+		resultChan <- <-l.ctrl.manager.startResultChan
 	}()
 
-	// Run the container.
-	if err := l.Run(); err != nil {
-		t.Errorf("error running container: %v", err)
+	// Run the container, with a deadline. A failed gofer handshake hangs
+	// inside lisafs.NewClient (its error path calls Client.Close(), which
+	// waits for a worker that never started), and an unbounded Run() then
+	// turns that into the whole test binary timing out with no failure
+	// message. The goroutine leaks on timeout, which is acceptable in a
+	// test that is already failing.
+	runResult := make(chan error, 1)
+	go func() { runResult <- l.Run() }()
+	var runErr error
+	select {
+	case runErr = <-runResult:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Loader.Run() did not return within 60s; the gofer handshake likely failed and lisafs.NewClient hung in its error path")
+	}
+	if runErr != nil {
+		t.Errorf("error running container: %v", runErr)
 	}
 
-	// We should have not gotten an error on the startResultChan.
-	wg.Wait()
-	if resultChanErr != nil {
-		t.Errorf("error on startResultChan: %v", resultChanErr)
+	// We should have not gotten an error on the startResultChan. Wait with a
+	// deadline: when Run() fails early nothing is ever sent, and waiting
+	// forever turns a failed test into a stalled one, which the watchdog
+	// reports as a sandbox hang and which takes the whole test binary down
+	// with it.
+	select {
+	case resultChanErr := <-resultChan:
+		if resultChanErr != nil {
+			t.Errorf("error on startResultChan: %v", resultChanErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("timed out waiting for the start result; Run() returned %v", runErr)
+	}
+	if runErr != nil {
+		// The sandbox never started, so there is nothing to wait for
+		// below and doing so would block until the test times out.
+		return
 	}
 
 	// Wait for the application to exit.  It should succeed.
