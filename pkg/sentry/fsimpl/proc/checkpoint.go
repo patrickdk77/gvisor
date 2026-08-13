@@ -45,7 +45,15 @@ func (fs *filesystem) newGvisorInode(ctx context.Context, root *auth.Credentials
 		return nil, err
 	}
 	gvisorFiles["checkpoint"] = checkpoint
-	gvisorFiles["spec_environ"] = fs.newInode(ctx, root, 0444, &specEnvironData{k: k})
+	if internalData.SaveTriggerEnabled {
+		// The container's spec environment holds whatever the pod spec
+		// put there, secrets included, so it is only exposed to the
+		// container that asked to drive checkpointing, and only to its
+		// owner: /proc/PID/environ, the interface this mirrors, is 0400
+		// and restricted to a process the reader may trace, whereas this
+		// file is the initial environment of the whole container.
+		gvisorFiles["spec_environ"] = fs.newInode(ctx, root, 0400, &specEnvironData{k: k})
+	}
 	if internalData.FSCheckpointEnabled {
 		log.Infof("Setting up fscheckpoint files under [procfs]/gvisor")
 		fsCheckpoint, err := newFSCheckpointInode(ctx, k, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno())
