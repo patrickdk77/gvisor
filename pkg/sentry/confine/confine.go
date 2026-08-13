@@ -29,6 +29,7 @@ package confine
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -115,6 +116,11 @@ type ExecRule struct {
 
 	// Target is the profile named after "->", empty if the rule names none.
 	Target string
+
+	// Scrub is set for the uppercase form of a transition modifier, which
+	// apparmor.d(5) defines as invoking "the Linux Kernel's unsafe_exec
+	// routines to scrub the environment, similar to setuid programs".
+	Scrub bool
 }
 
 // ChangeRule is one change_profile rule: the pattern of the profiles it names
@@ -238,7 +244,7 @@ func (p *Profile) index() {
 // permitting the transition means.
 func CheckChangeProfile(from, to string) error {
 	if !HasProfile(to) {
-		log.Warningf("confinement: profile %q denied change to %q: the policy does not define it", from, to)
+		warnf("confinement: profile %q denied change to %q: the policy does not define it", from, to)
 		return linuxerr.EACCES
 	}
 	if from == "" {
@@ -251,7 +257,7 @@ func CheckChangeProfile(from, to string) error {
 	}
 	profile := profileFor(from)
 	if profile == nil {
-		log.Warningf("confinement: task in undefined profile %q denied change to %q", from, to)
+		warnf("confinement: task in undefined profile %q denied change to %q", from, to)
 		return linuxerr.EACCES
 	}
 	allowed := false
@@ -276,10 +282,10 @@ func CheckChangeProfile(from, to string) error {
 // it with. A complain-mode profile logs and permits.
 func (p *Profile) denyChange(to, why string) error {
 	if p.Complain {
-		log.Warningf("confinement: profile %q would have denied a change to %q (%s); permitted, profile is in complain mode", p.Name, to, why)
+		warnf("confinement: profile %q would have denied a change to %q (%s); permitted, profile is in complain mode", p.Name, to, why)
 		return nil
 	}
-	log.Warningf("confinement: profile %q denied a change to %q (%s)", p.Name, to, why)
+	warnf("confinement: profile %q denied a change to %q (%s)", p.Name, to, why)
 	return linuxerr.EACCES
 }
 
@@ -292,60 +298,60 @@ func (p *Profile) denyChange(to, why string) error {
 // transition wins over one that does not. An error fails the exec, which is
 // what a "px" rule naming a profile the policy does not define must do: running
 // the program in the wrong profile is not a safe substitute.
-func TransitionOnExec(from, path string) (string, error) {
+func TransitionOnExec(from, path string) (string, bool, error) {
 	if from == "" {
 		// An unconfined task enters the profile named after the
 		// executable, if the policy defines one.
 		if name, ok := auth.ExecConfinementProfile(path); ok {
-			return name, nil
+			return name, false, nil
 		}
-		return "", nil
+		return "", false, nil
 	}
 	profile := profileFor(from)
 	if profile == nil {
 		// A task in a profile the policy does not define is denied
 		// everything; it must not exec its way out of that.
-		return from, nil
+		return from, false, nil
 	}
 	r := profile.execRuleFor(path)
 	if r == nil {
 		// No exec rule matched. The file check has already decided
 		// whether the exec is permitted at all, so keep the profile.
-		return from, nil
+		return from, false, nil
 	}
 	switch r.Mode {
 	case ExecInherit:
-		return from, nil
+		return from, false, nil
 	case ExecUnconfined:
 		// The only way out of a profile, and only because the profile
 		// asks for it. Worth a log line either way.
 		log.Infof("confinement: profile %q runs %q unconfined (rule %q)", from, path, r.Pattern)
-		return "", nil
+		return "", r.Scrub, nil
 	case ExecProfile:
 		target := r.Target
 		if target == "" {
 			target = path
 		}
 		if !HasProfile(target) {
-			log.Warningf("confinement: profile %q denied exec of %q: its rule %q requires profile %q, which the policy does not define", from, path, r.Pattern, target)
-			return "", linuxerr.EACCES
+			warnf("confinement: profile %q denied exec of %q: its rule %q requires profile %q, which the policy does not define", from, path, r.Pattern, target)
+			return "", false, linuxerr.EACCES
 		}
-		return target, nil
+		return target, r.Scrub, nil
 	case ExecChild:
 		target := from + "//" + r.Target
 		if !HasProfile(target) {
-			log.Warningf("confinement: profile %q denied exec of %q: its rule %q requires child profile %q, which the policy does not define", from, path, r.Pattern, target)
-			return "", linuxerr.EACCES
+			warnf("confinement: profile %q denied exec of %q: its rule %q requires child profile %q, which the policy does not define", from, path, r.Pattern, target)
+			return "", false, linuxerr.EACCES
 		}
-		return target, nil
+		return target, r.Scrub, nil
 	default:
 		// No modifier: enter the profile named after the executable if
 		// there is one, which is what a path-named profile means, and
 		// keep the current profile otherwise.
 		if name, ok := auth.ExecConfinementProfile(path); ok {
-			return name, nil
+			return name, false, nil
 		}
-		return from, nil
+		return from, false, nil
 	}
 }
 
@@ -374,6 +380,27 @@ func (p *Profile) execRuleFor(path string) *ExecRule {
 	return best
 }
 
+// userLog, when set, receives denials in addition to the sentry log, so that
+// they reach the container's own log. A denial is a fact about the workload,
+// not about the sandbox, so whoever runs the workload has to be able to see it
+// without access to the node's logs.
+var userLog atomic.Pointer[log.BasicLogger]
+
+// SetUserLogger installs the logger that denials are also written to. It is
+// called during sandbox startup, before application tasks run.
+func SetUserLogger(l *log.BasicLogger) {
+	userLog.Store(l)
+}
+
+// warnf records a denial in the sentry log and, if one is set, the container's
+// log.
+func warnf(format string, args ...any) {
+	log.Warningf(format, args...)
+	if l := userLog.Load(); l != nil {
+		l.Warningf(format, args...)
+	}
+}
+
 // HasProfile reports whether the policy defines the named profile. A task
 // must not be put into a profile that is not defined: enforcement denies
 // every access of a task in an undefined profile.
@@ -398,7 +425,15 @@ func permsFor(ats vfs.AccessTypes, isDir bool) Perm {
 	if ats.MayRead() {
 		p |= Read
 	}
-	if ats.MayWrite() {
+	if ats.MayWrite() && !isDir {
+		// A directory's write permission is not mediated by AppArmor.
+		// Creating, removing or renaming an entry is mediated by a rule
+		// for that entry's own path, which the filesystem checks
+		// separately; the write permission the kernel requires on the
+		// directory holding it is a DAC rule with no AppArmor
+		// equivalent. Requiring it here denied writes a profile allows,
+		// such as creating a session file under a directory a profile
+		// grants only read.
 		p |= Write
 	}
 	if ats.MayExec() && !isDir {
@@ -422,8 +457,11 @@ func ParsePerms(s string) Perm {
 		case 'r':
 			p |= Read
 		case 'w':
-			// AppArmor's 'w' grants appending as well.
-			p |= Write | Append
+			// "Allows the program to have write access to the file.
+			// This mode conflicts with append mode." Write does not
+			// imply Append, and a rule carrying both is contradictory
+			// policy rather than a broader grant.
+			p |= Write
 		case 'a':
 			p |= Append
 		case 'x':
@@ -622,6 +660,17 @@ func Check(creds *auth.Credentials, path string, ats vfs.AccessTypes, mode linux
 	return CheckPerms(creds, path, want, mode, kuid)
 }
 
+// CheckAppendWrite evaluates a write to path that the application opened with
+// O_APPEND. Per apparmor.d(5), append mode "will prevent an application from
+// opening the file for write unless it passes the O_APPEND parameter flag on
+// open", so such a write is permitted by either 'a' or 'w'.
+func CheckAppendWrite(creds *auth.Credentials, path string, mode linux.FileMode, kuid auth.KUID) error {
+	if err := CheckPerms(creds, path, Append, mode, kuid); err == nil {
+		return nil
+	}
+	return CheckPerms(creds, path, Write, mode, kuid)
+}
+
 // CheckPerms evaluates the rules of the profile the accessing task has entered
 // against path, for the permissions in want. It returns nil if all of them are
 // granted. Callers that mediate an access which does not correspond to a
@@ -631,7 +680,7 @@ func CheckPerms(creds *auth.Credentials, path string, want Perm, mode linux.File
 	if profile == nil {
 		// The task entered a profile the policy does not define. Deny,
 		// rather than silently leaving it unconfined.
-		log.Warningf("confinement: task in undefined profile %q denied access to %q", creds.ConfinementProfile, path)
+		warnf("confinement: task in undefined profile %q denied access to %q", creds.ConfinementProfile, path)
 		return linuxerr.EACCES
 	}
 	owned := kuid == creds.EffectiveKUID
@@ -696,10 +745,10 @@ func (profile *Profile) checkLinear(path string, want Perm, owned bool) error {
 // kernel.
 func (p *Profile) deny(perms, path, why string) error {
 	if p.Complain {
-		log.Warningf("confinement: profile %q would have denied %s of %q (%s); permitted, profile is in complain mode", p.Name, perms, path, why)
+		warnf("confinement: profile %q would have denied %s of %q (%s); permitted, profile is in complain mode", p.Name, perms, path, why)
 		return nil
 	}
-	log.Warningf("confinement: profile %q denied %s of %q (%s)", p.Name, perms, path, why)
+	warnf("confinement: profile %q denied %s of %q (%s)", p.Name, perms, path, why)
 	return linuxerr.EACCES
 }
 

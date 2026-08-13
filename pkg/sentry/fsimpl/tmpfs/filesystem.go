@@ -208,6 +208,10 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err := parentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return err
 	}
+	// Creating name is mediated by a rule for name's own path.
+	if err := parentDir.dentry.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+		return err
+	}
 	if err := create(parentDir, name); err != nil {
 		return err
 	}
@@ -600,6 +604,13 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := oldParentDir.dentry.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
+	// Renaming is mediated by rules for the two paths involved.
+	if err := oldParentDir.dentry.checkChildConfinement(rp.Credentials(), oldName, vfs.MayWrite); err != nil {
+		return err
+	}
+	if err := newParentDir.dentry.checkChildConfinement(rp.Credentials(), newName, vfs.MayWrite); err != nil {
+		return err
+	}
 	renamed, ok := oldParentDir.childMap[oldName]
 	if !ok {
 		return linuxerr.ENOENT
@@ -792,6 +803,10 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	name := rp.Component()
+	// Removing name is mediated by a rule for name's own path.
+	if err := parentDir.dentry.checkChildConfinement(rp.Credentials(), name, vfs.MayWrite); err != nil {
+		return err
+	}
 	if name == "." {
 		return linuxerr.EINVAL
 	}

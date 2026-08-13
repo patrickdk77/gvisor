@@ -280,20 +280,26 @@ func literalPrefix(pattern string) (string, bool) {
 // execModeOf returns the transition a permission field's modifier letters ask
 // for. AppArmor's uppercase forms additionally scrub the environment, which is
 // not distinguished here.
-func execModeOf(perms string) confine.ExecMode {
+func execModeOf(perms string) (confine.ExecMode, bool) {
 	for _, c := range perms {
 		switch c {
 		case 'i':
-			return confine.ExecInherit
-		case 'p', 'P':
-			return confine.ExecProfile
-		case 'c', 'C':
-			return confine.ExecChild
-		case 'u', 'U':
-			return confine.ExecUnconfined
+			return confine.ExecInherit, false
+		case 'p':
+			return confine.ExecProfile, false
+		case 'P':
+			return confine.ExecProfile, true
+		case 'c':
+			return confine.ExecChild, false
+		case 'C':
+			return confine.ExecChild, true
+		case 'u':
+			return confine.ExecUnconfined, false
+		case 'U':
+			return confine.ExecUnconfined, true
 		}
 	}
-	return confine.ExecDefault
+	return confine.ExecDefault, false
 }
 
 func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRule, bool) {
@@ -379,12 +385,19 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 	// carries no transition.
 	var execRules []confine.ExecRule
 	if perms&confine.Exec != 0 && !deny {
-		mode := execModeOf(permField)
+		mode, scrub := execModeOf(permField)
+		if mode == confine.ExecDefault && body != "file" && !strings.HasPrefix(body, "file ") {
+			// "A bare 'x' is only allowed in rules with the deny
+			// qualifier". Guessing a transition for one would be
+			// inventing policy, so report it instead.
+			return nil, nil, false
+		}
 		for _, r := range out {
 			execRules = append(execRules, confine.ExecRule{
 				Pattern: r.Pattern,
 				Mode:    mode,
 				Target:  target,
+				Scrub:   scrub,
 			})
 		}
 	}
