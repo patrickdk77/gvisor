@@ -1,0 +1,15 @@
+# Real AppArmor file-class audit records, captured from a live kernel, with
+# the inputs that produced them. Tab-separated: profile, operation, path as
+# the application named it, pid, comm, requested mask, fsuid, ouid, record.
+#
+# Regenerate on any host with AppArmor:
+#   sudo apparmor_parser -r gvisor-conftest.aa   # grants /usr/** rmix and
+#                                                # libs, nothing else
+#   aa-exec -p gvisor-conftest -- cat /etc/locale.alias
+#   aa-exec -p gvisor-conftest -- ls /tmp/gvisor-conftest-dir
+#   aa-exec -p gvisor-conftest -- cat "/tmp/gvisor conftest space/x"
+#   sudo dmesg | grep 'apparmor="DENIED"'
+# and paste the payloads here with the pids and comms they carry.
+gvisor-conftest	open	/etc/locale.alias	2464634	cat	r	1000	0	apparmor="DENIED" operation="open" class="file" profile="gvisor-conftest" name="/etc/locale.alias" pid=2464634 comm="cat" requested_mask="r" denied_mask="r" fsuid=1000 ouid=0
+gvisor-conftest	open	/tmp/gvisor-conftest-dir/	2464708	ls	r	1000	1000	apparmor="DENIED" operation="open" class="file" profile="gvisor-conftest" name="/tmp/gvisor-conftest-dir/" pid=2464708 comm="ls" requested_mask="r" denied_mask="r" fsuid=1000 ouid=1000
+gvisor-conftest	open	/tmp/gvisor conftest space/x	2464898	cat	r	1000	1000	apparmor="DENIED" operation="open" class="file" profile="gvisor-conftest" name=2F746D702F677669736F7220636F6E66746573742073706163652F78 pid=2464898 comm="cat" requested_mask="r" denied_mask="r" fsuid=1000 ouid=1000

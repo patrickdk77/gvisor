@@ -71,6 +71,18 @@ type Credentials struct {
 	// sandbox-internal enforcement, it does not evaluate an AppArmor
 	// policy.
 	ConfinementProfile string
+
+	// HatToken is the magic token a task passed to aa_change_hat(3) when it
+	// entered its current hat, and HatParent is the profile it must return
+	// to. HatToken is zero when the task is not in a hat.
+	HatToken uint64
+
+	// HatParent is the profile a task in a hat returns to.
+	HatParent string
+
+	// OnExecProfile is the label to enter at the next execve(2), from
+	// aa_change_onexec(3) or aa_stack_onexec(3). It is cleared once applied.
+	OnExecProfile string
 }
 
 // Confined returns whether the credentials carry an in-sandbox confinement

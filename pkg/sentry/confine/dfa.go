@@ -88,6 +88,12 @@ type accept struct {
 
 	// deny is refused regardless of what is granted.
 	deny Perm
+
+	// audit is the permissions of the rules that carry the 'audit'
+	// qualifier, which are logged: an audited allow rule logs the access it
+	// permits, and an audited deny rule logs the denial, which is otherwise
+	// silent.
+	audit Perm
 }
 
 // dfa is a profile compiled into an automaton over the bytes of a path. States
@@ -236,10 +242,34 @@ func patternItems(pattern string) ([]item, bool) {
 		switch c := pattern[i]; c {
 		case '{', '}':
 			return nil, false
+		case '\x00':
+			// A marker from the policy parser: the wildcard it
+			// precedes came from inside a brace alternation and is
+			// bare. Consume it so the star below is compiled without
+			// the whole-component minimum. See markBraceWildcards.
+			continue
 		case '?':
 			out = append(out, item{kind: itemAnyNonSlash})
 		case '*':
-			if i+1 < len(pattern) && pattern[i+1] == '*' {
+			doubled := i+1 < len(pattern) && pattern[i+1] == '*'
+			after := i + 1
+			if doubled {
+				after = i + 2
+			}
+			braceOrigin := i > 0 && pattern[i-1] == '\x00'
+			// A wildcard that is a whole path component, meaning it
+			// follows a '/' and is followed by a '/' or the end of
+			// the pattern, cannot match an empty component:
+			// apparmor_parser compiles "/a/*" to "[^/\x00][^/\x00]*"
+			// and "/a/**" to "[^/\x00][^\x00]*", one required
+			// character followed by the star. Anywhere else, such as
+			// in "*.php", or a brace-origin star, it compiles to the
+			// plain star. Expanding it the same way here is what keeps
+			// "/dir/*" from matching "/dir/".
+			if !braceOrigin && i > 0 && pattern[i-1] == '/' && (after == len(pattern) || pattern[after] == '/') {
+				out = append(out, item{kind: itemAnyNonSlash})
+			}
+			if doubled {
 				i++
 				out = append(out, item{kind: itemStarAny})
 				continue
@@ -274,9 +304,9 @@ func patternItems(pattern string) ([]item, bool) {
 				for b := range set {
 					set[b] = !set[b]
 				}
-				// A negated class does not match '/', as in
-				// AppArmor: a class never spans a component.
-				set['/'] = false
+				// A negated class does match '/': apparmor_parser
+				// compiles "[^b]" to "[^b]", with no separator
+				// exclusion, unlike '?' and '*'. See matchClass().
 			}
 			out = append(out, item{kind: itemClass, set: set})
 			i = end
@@ -493,6 +523,9 @@ func (b *builder) acceptOf(rules []Rule, set []int32) accept {
 			a.allowOwner |= r.Perms
 		default:
 			a.allowAny |= r.Perms
+		}
+		if r.Audit {
+			a.audit |= r.Perms
 		}
 	}
 	return a

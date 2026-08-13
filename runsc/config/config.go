@@ -387,6 +387,13 @@ type Config struct {
 	// AppArmorPolicySource.
 	AppArmorPolicyDir string `flag:"apparmor-policy-dir"`
 
+	// AppArmorAuditTarget is where in-sandbox AppArmor audit records are
+	// written: "stderr" (the default) or "stdout" for the container's own
+	// streams, which is where a cluster's log collection reads a workload's
+	// diagnostics from, "gvisor" for the sentry log, or "none" to discard
+	// them.
+	AppArmorAuditTarget string `flag:"apparmor-audit-target"`
+
 	// HostAppArmor controls whether the AppArmor profile named in the
 	// OCI spec is applied to the sentry and gofer processes, confining
 	// the host accesses they make on the application's behalf. Profiles

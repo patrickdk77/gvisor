@@ -47,8 +47,11 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/confine"
+	"strconv"
 )
 
 // AppArmorPolicy is the confinement policy derived from a set of AppArmor
@@ -143,10 +146,82 @@ func dedup(values []string) []string {
 	return out
 }
 
+// normalizeSlashes collapses runs of '/' into one, as apparmor_parser does.
+// Tunables conventionally end with a slash (@{run}=/run/, @{PROC}=/proc/), so a
+// rule written "@{run}/nscd/socket" expands to "/run//nscd/socket" and would
+// otherwise match nothing.
+func normalizeSlashes(pattern string) string {
+	if !strings.Contains(pattern, "//") {
+		return pattern
+	}
+	// Slashes at the beginning of a path denote a POSIX namespace and are
+	// left alone; only the rest are collapsed.
+	lead := 0
+	for lead < len(pattern) && pattern[lead] == '/' {
+		lead++
+	}
+	if lead > 2 {
+		lead = 1
+	}
+	var b strings.Builder
+	b.Grow(len(pattern))
+	b.WriteString(pattern[:lead])
+	prevSlash := false
+	for i := lead; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '/' && prevSlash {
+			continue
+		}
+		prevSlash = c == '/'
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // expandAlternations rewrites an AppArmor pattern's brace alternations into one
 // pattern per alternative, so that matching never has to do it. Expanding at
 // match time rebuilt the pattern for every alternative on every access, which
 // dominated the cost of a permission check.
+// braceWildcardMarker precedes a '*' or '**' that came from inside a brace
+// alternation. apparmor_parser compiles such a wildcard to a bare star with no
+// leading-component minimum, unlike a whole-component wildcard in the top-level
+// skeleton: "/a/{,**}" is "/a/(|[^\x00]*)", where the "**" is bare, while
+// "/a/**" is "/a/[^/\x00][^\x00]*". The marker records that origin so the
+// matcher does not apply the minimum. It is NUL, which cannot appear in a path.
+const braceWildcardMarker = "\x00"
+
+// markBraceWildcards prefixes every '*'/'**' that lies inside a brace group with
+// braceWildcardMarker, so that after the braces are expanded the matcher can
+// still tell a brace-origin wildcard (bare) from a top-level whole-component one
+// (which takes the minimum). Wildcards at brace depth zero are left untouched.
+func markBraceWildcards(pattern string) string {
+	if !strings.Contains(pattern, "{") {
+		return pattern
+	}
+	var b strings.Builder
+	b.Grow(len(pattern) + 4)
+	depth := 0
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case '*':
+			// Mark only the first star of a run, so "**" becomes one
+			// marked token rather than two.
+			if depth > 0 && (i == 0 || pattern[i-1] != '*') {
+				b.WriteString(braceWildcardMarker)
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func expandAlternations(pattern string) []string {
 	i := strings.IndexByte(pattern, '{')
 	if i < 0 {
@@ -167,7 +242,10 @@ func expandAlternations(pattern string) []string {
 				// An alternative may itself contain braces.
 				out = append(out, expandAlternations(pattern[:i]+alt+pattern[j+1:])...)
 				if len(out) >= maxExpansion {
-					log.Warningf("AppArmor: pattern %q expands to more than %d alternatives; keeping the first %d, the rest are not enforced", pattern, maxExpansion, maxExpansion)
+					// The pattern may carry brace-wildcard markers
+					// by this point; they are internal, so they
+					// are not shown.
+					log.Warningf("AppArmor: pattern %q expands to more than %d alternatives; keeping the first %d, the rest are not enforced", strings.ReplaceAll(pattern, braceWildcardMarker, ""), maxExpansion, maxExpansion)
 					return out[:maxExpansion]
 				}
 			}
@@ -277,6 +355,38 @@ func literalPrefix(pattern string) (string, bool) {
 // parseFileRule parses one AppArmor file rule, expanding variables. A rule
 // with a multi-valued variable yields one confine.Rule per expansion. It
 // returns false for lines that are not file rules.
+// ruleFields splits a rule into fields, keeping a double-quoted path with
+// embedded spaces or tabs as one field. It reports false if a quote is
+// unterminated.
+func ruleFields(body string) ([]string, bool) {
+	var (
+		out   []string
+		cur   strings.Builder
+		quote bool
+	)
+	flush := func() {
+		if cur.Len() != 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c == '"':
+			quote = !quote
+		case (c == ' ' || c == '\t') && !quote:
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if quote {
+		return nil, false
+	}
+	flush()
+	return out, true
+}
+
 // execModeOf returns the transition a permission field's modifier letters ask
 // for. AppArmor's uppercase forms additionally scrub the environment, which is
 // not distinguished here.
@@ -302,9 +412,9 @@ func execModeOf(perms string) (confine.ExecMode, bool) {
 	return confine.ExecDefault, false
 }
 
-func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRule, bool) {
+func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRule, []confine.LinkRule, bool) {
 	body := strings.TrimSuffix(strings.TrimSpace(line), ",")
-	var owner, deny bool
+	var owner, deny, audit bool
 	for {
 		switch {
 		case strings.HasPrefix(body, "owner "):
@@ -316,6 +426,7 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 			body = strings.TrimSpace(body[len("deny "):])
 			continue
 		case strings.HasPrefix(body, "audit "):
+			audit = true
 			body = strings.TrimSpace(body[len("audit "):])
 			continue
 		case strings.HasPrefix(body, "allow "):
@@ -327,23 +438,40 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 	// The "file" rule class. Bare "file" is every access to every path;
 	// "file /p rw" is the same as "/p rw".
 	if body == "file" {
+		// apparmor_parser expands bare "file" to /{**,}, which matches "/"
+		// itself: the compiled regex is /([^\x00]*|). "/**" alone does not,
+		// because a whole-component wildcard needs at least one character
+		// after the slash, so a profile built on bare "file" could not open
+		// the root directory. Two patterns cover the same set of real paths.
 		rules := []confine.Rule{{
 			Pattern: "/**",
 			Perms:   confine.ParsePerms("mrwlkix"),
 			Owner:   owner,
 			Deny:    deny,
+			Audit:   audit,
+		}, {
+			Pattern: "/",
+			Perms:   confine.ParsePerms("mrwlkix"),
+			Owner:   owner,
+			Deny:    deny,
+			Audit:   audit,
+		}}
+		links := []confine.LinkRule{{
+			Pattern: "/**",
+			Target:  "/**",
+			Subset:  true,
+			Owner:   owner,
+			Deny:    deny,
+			Audit:   audit,
 		}}
 		if deny {
-			return rules, nil, true
+			return rules, nil, links, true
 		}
 		// "file" grants exec with no transition modifier.
-		return rules, []confine.ExecRule{{Pattern: "/**"}}, true
+		return rules, []confine.ExecRule{{Pattern: "/**"}}, links, true
 	}
 	if rest, ok := strings.CutPrefix(body, "file "); ok {
 		body = strings.TrimSpace(rest)
-	}
-	if !strings.HasPrefix(body, "/") && !strings.HasPrefix(body, "@{") {
-		return nil, nil, false
 	}
 	// A rule may name a target: "/path Px -> profile" for an exec
 	// transition, "/path l -> /target" for a link. The permissions are the
@@ -354,31 +482,52 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 		body = strings.TrimSpace(before)
 		target = strings.Trim(strings.TrimSpace(after), `"`)
 	}
-	fields := strings.Fields(body)
-	if len(fields) < 2 {
-		return nil, nil, false
+	fields, ok := ruleFields(body)
+	if !ok || len(fields) < 2 {
+		return nil, nil, nil, false
 	}
 	permField := fields[len(fields)-1]
 	perms := confine.ParsePerms(permField)
 	if perms == 0 {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	var out []confine.Rule
 	for _, expanded := range tun.expand(fields[0]) {
 		if !strings.HasPrefix(expanded, "/") {
 			continue
 		}
-		for _, pattern := range expandAlternations(expanded) {
+		for _, pattern := range expandAlternations(markBraceWildcards(expanded)) {
 			out = append(out, confine.Rule{
-				Pattern: pattern,
+				Pattern: normalizeSlashes(pattern),
 				Perms:   perms,
 				Owner:   owner,
 				Deny:    deny,
+				Audit:   audit,
 			})
 		}
 	}
 	if len(out) == 0 {
-		return nil, nil, false
+		return nil, nil, nil, false
+	}
+	// The 'l' permission is a link rule: "/foo l," is
+	// "link subset /foo -> /**,". A target may be named explicitly, as in
+	// "/foo l -> /bar,".
+	var linkRules []confine.LinkRule
+	if perms&confine.Link != 0 {
+		linkTarget := target
+		if linkTarget == "" {
+			linkTarget = "/**"
+		}
+		for _, r := range out {
+			linkRules = append(linkRules, confine.LinkRule{
+				Pattern: r.Pattern,
+				Target:  linkTarget,
+				Subset:  true,
+				Owner:   owner,
+				Deny:    deny,
+				Audit:   audit,
+			})
+		}
 	}
 	// A rule that permits execution also decides the profile a task enters
 	// when it execs a matching path. A deny rule grants nothing, so it
@@ -390,7 +539,7 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 			// "A bare 'x' is only allowed in rules with the deny
 			// qualifier". Guessing a transition for one would be
 			// inventing policy, so report it instead.
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		for _, r := range out {
 			execRules = append(execRules, confine.ExecRule{
@@ -401,7 +550,7 @@ func parseFileRule(line string, tun tunables) ([]confine.Rule, []confine.ExecRul
 			})
 		}
 	}
-	return out, execRules, true
+	return out, execRules, linkRules, true
 }
 
 // ParseAppArmorProfiles derives policy from the AppArmor profile text in r.
@@ -464,19 +613,54 @@ func parseAppArmorProfiles(pfs policyFS, r io.Reader, name string, policy *AppAr
 			stack = append(stack, profile)
 			profile = strings.TrimSuffix(fields[1], "{")
 			policy.Profiles = append(policy.Profiles, profile)
+			// "The special @{profile_name} variable is automatically
+			// set to the current profile's name."
+			tun["profile_name"] = []string{profile}
 			if hasComplainFlag(line) {
 				// A complain profile logs what it would deny
 				// and permits it. Record it now: the profile
 				// may have no rules of its own.
 				profileRules(policy, profile).Complain = true
 			}
-			// A profile named after a path attaches on exec of that
-			// path, as AppArmor does.
+			if hasAuditFlag(line) {
+				profileRules(policy, profile).Audit = true
+			}
+			if mode, sig, errno := profileModeFlags(line); mode != confine.ModeEnforce || sig != 0 || errno != 0 {
+				cp := profileRules(policy, profile)
+				cp.Mode = mode
+				cp.KillSignal = sig
+				cp.Error = errno
+			}
+			// A profile attaches on exec of the path it names. That is
+			// the profile's own name when the name is a path
+			// ("profile /bin/cagebash {"), or the attachment
+			// specification that follows the name ("profile jail
+			// /bin/cagebash {").
+			attach := ""
 			if strings.HasPrefix(profile, "/") {
+				attach = profile
+			} else if len(fields) >= 3 {
+				if spec := strings.TrimSuffix(fields[2], "{"); strings.HasPrefix(spec, "/") || strings.HasPrefix(spec, "@{") {
+					attach = spec
+				}
+			}
+			if attach != "" {
 				if policy.ExecAttach == nil {
 					policy.ExecAttach = make(map[string]string)
 				}
-				policy.ExecAttach[profile] = profile
+				// The attachment is one AARE expression, not a list, but
+				// variables and alternations give it several values:
+				// "profile cagebash /{usr/,}bin/cagebash" attaches both
+				// /usr/bin/cagebash and /bin/cagebash on a real kernel,
+				// and each value must enter the profile here too.
+				for _, v := range tun.expand(attach) {
+					for _, a := range expandAlternations(markBraceWildcards(v)) {
+						a = strings.ReplaceAll(a, braceWildcardMarker, "")
+						if strings.HasPrefix(a, "/") {
+							policy.ExecAttach[a] = profile
+						}
+					}
+				}
 			}
 			continue
 		}
@@ -498,6 +682,25 @@ func parseAppArmorProfiles(pfs policyFS, r io.Reader, name string, policy *AppAr
 		if i := strings.Index(line, " #"); i >= 0 {
 			line = strings.TrimSpace(line[:i])
 			if len(line) == 0 {
+				continue
+			}
+		}
+		// A hat is a subprofile of the profile being parsed, named
+		// "<profile>//^<hat>", and is the only kind of subprofile
+		// aa_change_hat(3) may enter.
+		if profile != "" {
+			if hat, ok := hatDeclaration(line); ok {
+				stack = append(stack, profile)
+				profile = confine.HatName(profile, hat)
+				policy.Profiles = append(policy.Profiles, profile)
+				cp := profileRules(policy, profile)
+				cp.IsHat = true
+				if hasComplainFlag(line) {
+					cp.Complain = true
+				}
+				if hasAuditFlag(line) {
+					cp.Audit = true
+				}
 				continue
 			}
 		}
@@ -524,12 +727,18 @@ func parseAppArmorProfiles(pfs policyFS, r io.Reader, name string, policy *AppAr
 			})
 			continue
 		}
+		if rules, linkRules, ok := parseLinkRule(line, tun); ok {
+			cp := profileRules(policy, profile)
+			cp.Rules = append(cp.Rules, rules...)
+			cp.LinkRules = append(cp.LinkRules, linkRules...)
+			continue
+		}
 		if targets, ok := parseChangeProfileRule(line, tun); ok {
 			cp := profileRules(policy, profile)
 			cp.ChangeProfile = append(cp.ChangeProfile, targets...)
 			continue
 		}
-		rule, execRules, ok := parseFileRule(line, tun)
+		rule, execRules, linkRules, ok := parseFileRule(line, tun)
 		if !ok {
 			if kind := strings.Fields(line)[0]; strings.HasPrefix(kind, "/") || strings.HasPrefix(kind, "@{") {
 				ignored["file rule (unparsed)"]++
@@ -544,6 +753,7 @@ func parseAppArmorProfiles(pfs policyFS, r io.Reader, name string, policy *AppAr
 		cp := profileRules(policy, profile)
 		cp.Rules = append(cp.Rules, rule...)
 		cp.ExecRules = append(cp.ExecRules, execRules...)
+		cp.LinkRules = append(cp.LinkRules, linkRules...)
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("reading %s: %w", name, err)
@@ -645,16 +855,134 @@ var flagsRE = regexp.MustCompile(`flags\s*=\s*\(([^)]*)\)`)
 // hasComplainFlag reports whether a profile declaration carries the complain
 // flag, which makes the profile log what it would deny rather than deny it.
 func hasComplainFlag(line string) bool {
+	return hasProfileFlag(line, "complain")
+}
+
+// hasAuditFlag reports whether a profile declaration carries the audit flag,
+// which "causes all actions whether allowed or denied to be logged".
+func hasAuditFlag(line string) bool {
+	return hasProfileFlag(line, "audit")
+}
+
+// profileModeFlags reads the enforcement mode, kill signal and error code a
+// profile declaration's flags select.
+func profileModeFlags(line string) (confine.ProfileMode, int32, int32) {
+	mode := confine.ModeEnforce
+	var killSignal, errno int32
+	m := flagsRE.FindStringSubmatch(line)
+	if m == nil {
+		return mode, 0, 0
+	}
+	for _, f := range strings.Split(m[1], ",") {
+		f = strings.TrimSpace(f)
+		switch {
+		case f == "enforce":
+			mode = confine.ModeEnforce
+		case f == "complain":
+			mode = confine.ModeComplain
+		case f == "kill":
+			mode = confine.ModeKill
+		case f == "default_allow":
+			mode = confine.ModeDefaultAllow
+		case f == "unconfined":
+			mode = confine.ModeUnconfined
+		case strings.HasPrefix(f, "kill.signal="):
+			if sig, ok := signalNumber(strings.TrimPrefix(f, "kill.signal=")); ok {
+				killSignal = sig
+			}
+		case strings.HasPrefix(f, "error="):
+			if e, ok := errnoNumber(strings.TrimPrefix(f, "error=")); ok {
+				errno = e
+			}
+		}
+	}
+	return mode, killSignal, errno
+}
+
+// signalNumber resolves a signal named in "kill.signal=", by number or by name
+// with or without the SIG prefix.
+func signalNumber(s string) (int32, bool) {
+	s = strings.TrimSpace(s)
+	if n, err := strconv.Atoi(s); err == nil {
+		if !linux.Signal(n).IsValid() {
+			return 0, false
+		}
+		return int32(n), true
+	}
+	name := strings.ToUpper(strings.TrimPrefix(strings.ToUpper(s), "SIG"))
+	switch name {
+	case "KILL":
+		return int32(linux.SIGKILL), true
+	case "TERM":
+		return int32(linux.SIGTERM), true
+	case "ABRT":
+		return int32(linux.SIGABRT), true
+	case "SEGV":
+		return int32(linux.SIGSEGV), true
+	case "QUIT":
+		return int32(linux.SIGQUIT), true
+	case "STOP":
+		return int32(linux.SIGSTOP), true
+	}
+	return 0, false
+}
+
+// errnoNumber resolves an errno named in "error=", by number or by name.
+func errnoNumber(s string) (int32, bool) {
+	s = strings.TrimSpace(s)
+	if n, err := strconv.Atoi(s); err == nil {
+		if !linux.Signal(n).IsValid() {
+			return 0, false
+		}
+		return int32(n), true
+	}
+	switch strings.ToUpper(s) {
+	case "EACCES":
+		return int32(unix.EACCES), true
+	case "EPERM":
+		return int32(unix.EPERM), true
+	case "ENOENT":
+		return int32(unix.ENOENT), true
+	case "EROFS":
+		return int32(unix.EROFS), true
+	case "EIO":
+		return int32(unix.EIO), true
+	}
+	return 0, false
+}
+
+// hasProfileFlag reports whether a profile declaration carries a flag.
+func hasProfileFlag(line, want string) bool {
 	m := flagsRE.FindStringSubmatch(line)
 	if m == nil {
 		return false
 	}
 	for _, f := range strings.Split(m[1], ",") {
-		if strings.TrimSpace(f) == "complain" {
+		if strings.TrimSpace(f) == want {
 			return true
 		}
 	}
 	return false
+}
+
+// hatDeclaration returns the name of the hat a line declares, if it declares
+// one. A hat is written "^name { ... }" or "hat name { ... }".
+func hatDeclaration(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, "^")
+	if !ok {
+		if rest, ok = strings.CutPrefix(line, "hat "); !ok {
+			return "", false
+		}
+	}
+	rest = strings.TrimSpace(rest)
+	// The name runs to the flags, the brace, or the end of the line.
+	if i := strings.IndexAny(rest, " \t{"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
 }
 
 // profileRules returns the named profile's entry in policy, creating it if
@@ -671,10 +999,101 @@ func profileRules(policy *AppArmorPolicy, profile string) *confine.Profile {
 	return cp
 }
 
+// parseLinkRule parses "link [subset] /source -> /target,". apparmor.d(5)
+// defines "l /foo" as shorthand for "link subset /foo -> /**", so a link rule
+// grants 'l' on the source; the target is not otherwise mediated here, and the
+// subset condition is applied by the same check the 'l' permission uses.
+func parseLinkRule(line string, tun tunables) ([]confine.Rule, []confine.LinkRule, bool) {
+	body := strings.TrimSuffix(strings.TrimSpace(line), ",")
+	var deny, audit, owner bool
+	for {
+		switch {
+		case strings.HasPrefix(body, "deny "):
+			deny = true
+			body = strings.TrimSpace(body[len("deny "):])
+			continue
+		case strings.HasPrefix(body, "audit "):
+			audit = true
+			body = strings.TrimSpace(body[len("audit "):])
+			continue
+		case strings.HasPrefix(body, "owner "):
+			owner = true
+			body = strings.TrimSpace(body[len("owner "):])
+			continue
+		case strings.HasPrefix(body, "allow "):
+			body = strings.TrimSpace(body[len("allow "):])
+			continue
+		}
+		break
+	}
+	rest, ok := strings.CutPrefix(body, "link ")
+	if !ok {
+		return nil, nil, false
+	}
+	rest = strings.TrimSpace(rest)
+	// "subset" is a condition, not part of the path. Without it the link may
+	// have permissions the file it points at does not.
+	subset := false
+	if after, ok := strings.CutPrefix(rest, "subset "); ok {
+		rest = strings.TrimSpace(after)
+		subset = true
+	}
+	source, targetField, ok := strings.Cut(rest, "->")
+	if !ok {
+		// A link rule without a target names only the source.
+		source = rest
+	}
+	source = strings.Trim(strings.TrimSpace(source), `"`)
+	if !strings.HasPrefix(source, "/") && !strings.HasPrefix(source, "@{") {
+		return nil, nil, false
+	}
+	targets := []string{"/**"}
+	if t := strings.Trim(strings.TrimSpace(targetField), `"`); t != "" {
+		targets = nil
+		for _, expanded := range tun.expand(t) {
+			targets = append(targets, expandAlternations(markBraceWildcards(normalizeSlashes(expanded)))...)
+		}
+		if len(targets) == 0 {
+			return nil, nil, false
+		}
+	}
+	var (
+		out       []confine.Rule
+		linkRules []confine.LinkRule
+	)
+	for _, expanded := range tun.expand(source) {
+		for _, pattern := range expandAlternations(markBraceWildcards(expanded)) {
+			if !strings.HasPrefix(pattern, "/") {
+				continue
+			}
+			pattern = normalizeSlashes(pattern)
+			out = append(out, confine.Rule{
+				Pattern: pattern,
+				Perms:   confine.Link,
+				Owner:   owner,
+				Deny:    deny,
+				Audit:   audit,
+			})
+			for _, t := range targets {
+				linkRules = append(linkRules, confine.LinkRule{
+					Pattern: pattern,
+					Target:  t,
+					Subset:  subset,
+					Owner:   owner,
+					Deny:    deny,
+					Audit:   audit,
+				})
+			}
+		}
+	}
+	return out, linkRules, len(out) != 0
+}
+
 // parseChangeProfileRule parses a change_profile rule into the patterns of the
 // profiles it permits changing to. A bare "change_profile," permits any
-// profile. An exec condition ("change_profile /bin/foo -> bar") is not
-// evaluated; only its target is taken, which is never weaker than AppArmor.
+// profile. An exec condition ("change_profile /bin/foo -> bar") is recorded
+// with the rule, which then only permits the target on exec of a matching
+// path.
 func parseChangeProfileRule(line string, tun tunables) ([]confine.ChangeRule, bool) {
 	body := strings.TrimSuffix(strings.TrimSpace(line), ",")
 	var deny bool
@@ -702,18 +1121,14 @@ func parseChangeProfileRule(line string, tun tunables) ([]confine.ChangeRule, bo
 		// transition and "deny change_profile," refuses all of them.
 		return []confine.ChangeRule{{Pattern: "**", Deny: deny}}, true
 	}
-	// The remainder is "[<exec condition>] -> <target>". The exec
-	// condition restricts which executable the transition may accompany;
-	// it is not evaluated, which can only make the rule broader for an
-	// allow rule and narrower for a deny rule, so a deny rule that carries
-	// one is reported as unenforced rather than applied too widely.
+	// The remainder is "[<exec condition>] -> <target>". The exec condition
+	// restricts which executable the transition may accompany, and is
+	// evaluated when the transition is applied at exec.
 	execCond, target, ok := strings.Cut(rest, "->")
 	if !ok {
 		return nil, false
 	}
-	if deny && strings.TrimSpace(execCond) != "" {
-		return nil, false
-	}
+	execCond = strings.Trim(strings.TrimSpace(execCond), `"`)
 	target = strings.TrimSpace(target)
 	// A target may be quoted, and may name a profile through a variable.
 	target = strings.Trim(target, `"`)
@@ -722,7 +1137,7 @@ func parseChangeProfileRule(line string, tun tunables) ([]confine.ChangeRule, bo
 	}
 	var out []confine.ChangeRule
 	for _, pattern := range tun.expand(target) {
-		out = append(out, confine.ChangeRule{Pattern: pattern, Deny: deny})
+		out = append(out, confine.ChangeRule{Pattern: pattern, Deny: deny, Exec: execCond})
 	}
 	return out, len(out) != 0
 }

@@ -588,3 +588,33 @@ func TestMRemapMappableOffsetOverflow(t *testing.T) {
 		t.Errorf("MRemap grow got err %v want EINVAL", err)
 	}
 }
+
+// TestFileMappingsForExecSkipsAnonymous checks that an anonymous mapping, which
+// has no MappingIdentity, is not returned by FileMappingsForExec. mprotect
+// confinement uses this to mediate making a file executable, and an anonymous
+// mapping has no file and no path, so a host kernel does not mediate it either.
+func TestFileMappingsForExecSkipsAnonymous(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   2 * hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.AnyAccess,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	ar, ok := addr.ToRange(2 * hostarch.PageSize)
+	if !ok {
+		t.Fatal("bad range")
+	}
+	if files := mm.FileMappingsForExec(ar); len(files) != 0 {
+		t.Errorf("FileMappingsForExec returned %d files for an anonymous mapping, want 0", len(files))
+		for _, f := range files {
+			f.DecRef(ctx)
+		}
+	}
+}

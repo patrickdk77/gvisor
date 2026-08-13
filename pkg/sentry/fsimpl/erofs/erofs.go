@@ -41,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/confine"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -390,7 +391,7 @@ func (i *inode) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) e
 // profile the accessing task has entered, if any. Callers that have a dentry
 // use this rather than inode.checkPermissions, since only the dentry knows the
 // path a profile's rules are matched against.
-func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
+func (d *dentry) checkPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	if err := d.inode.checkPermissions(creds, ats); err != nil {
 		return err
 	}
@@ -402,7 +403,41 @@ func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) 
 		// a rule to match; see the equivalent case in tmpfs.
 		return nil
 	}
+	mode := linux.FileMode(d.inode.Mode())
+	if !confine.Mediates(ats, mode.FileType() == linux.ModeDirectory) {
+		// Traversal is not mediated; skip the path construction.
+		return nil
+	}
 	// Walk to the filesystem root, collecting names.
+	var names []string
+	for cur := d; cur != nil; cur = cur.parent.Load() {
+		names = append(names, cur.name)
+	}
+	path := confine.Path(d.inode.fs.iopts.UniqueID.Path, names,
+		mode.FileType() == linux.ModeDirectory)
+	return confine.Check(ctx, creds, confine.OpFperm, path, ats, mode,
+		auth.KUID(d.inode.UID()))
+}
+
+// Reading a file's metadata is not mediated. Linux registers an inode_getattr
+// hook, but a real kernel does not deny a stat of a path that no rule in the
+// profile matches: verified against apparmor 4.0.1 with a production profile,
+// where "aa-exec -p cageweb -- stat <site path>" succeeds and audits nothing
+// even though none of that profile's 487 compiled rules match the path.
+// Mediating it here denied what a host kernel permits, which is worse than not
+// mediating it at all.
+
+// checkLockConfinement mediates locking d, which AppArmor asks for
+// AA_MAY_LOCK for and 'k' grants.
+func (d *dentry) checkLockConfinement(ctx context.Context, creds *auth.Credentials) error {
+	return d.checkConfinePerm(ctx, creds, confine.OpFlock, confine.Lock)
+}
+
+// checkConfinePerm evaluates one permission against d's path.
+func (d *dentry) checkConfinePerm(ctx context.Context, creds *auth.Credentials, op confine.Op, want confine.Perm) error {
+	if !creds.Confined() || d.inode.fs.iopts.UniqueID.Path == "" {
+		return nil
+	}
 	var names []string
 	for cur := d; cur != nil; cur = cur.parent.Load() {
 		names = append(names, cur.name)
@@ -410,7 +445,8 @@ func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) 
 	mode := linux.FileMode(d.inode.Mode())
 	path := confine.Path(d.inode.fs.iopts.UniqueID.Path, names,
 		mode.FileType() == linux.ModeDirectory)
-	return confine.Check(creds, path, ats, mode, auth.KUID(d.inode.UID()))
+	return confine.CheckPerms(ctx, creds, op, path, want, mode,
+		auth.KUID(d.inode.UID()))
 }
 
 func (i *inode) statTo(stat *linux.Statx) {
@@ -773,7 +809,7 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
-	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
+	if err := d.checkPermissions(ctx, rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
 
@@ -882,3 +918,29 @@ func (*fileDescription) Sync(context.Context, vfs.SyncOptions) error {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (*fileDescription) Release(ctx context.Context) {}
+
+// LockBSD implements vfs.FileDescriptionImpl.LockBSD.
+func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
+	return fd.LockFD.LockBSD(ctx, uid, ownerPID, t, block)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
+	if err := fd.checkLockConfinement(ctx); err != nil {
+		return err
+	}
+	return fd.LockFD.LockPOSIX(ctx, uid, ownerPID, t, r, block)
+}
+
+// checkLockConfinement mediates locking the file, which AppArmor asks for
+// AA_MAY_LOCK for and 'k' grants.
+func (fd *fileDescription) checkLockConfinement(ctx context.Context) error {
+	creds := auth.CredentialsFromContext(ctx)
+	if creds == nil || !creds.Confined() {
+		return nil
+	}
+	return fd.dentry().checkLockConfinement(ctx, creds)
+}

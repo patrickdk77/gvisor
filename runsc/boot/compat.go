@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/log"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
-	"gvisor.dev/gvisor/pkg/sentry/confine"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	spb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -35,11 +34,6 @@ func initCompatLogs(fd int) error {
 		return err
 	}
 	eventchannel.AddEmitter(ce)
-	// AppArmor denials are written to the container's log as well as the
-	// sentry's, since they describe what the workload was refused and are of
-	// no use to whoever runs the workload if only the node operator can see
-	// them.
-	confine.SetUserLogger(ce.sink)
 	return nil
 }
 

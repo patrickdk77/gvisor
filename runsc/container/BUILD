@@ -50,6 +50,7 @@ go_test(
     name = "container_test",
     size = "large",
     srcs = [
+        "apparmor_audit_test.go",
         "console_test.go",
         "container_save_restore_test.go",
         "container_test.go",

@@ -1,0 +1,69 @@
+# Real AppArmor decisions and records, captured from a live kernel enforcing
+# testdata/gvisor_behav.aa and testdata/gvisor_behav2.aa. Tab-separated: kind,
+# profile, arg1, arg2, file owner uid, expected outcome, pid, comm, record the
+# kernel logged (- for silence). Kinds: open (arg1 path, arg2 r|w),
+# openappend (O_APPEND write), mmap (PROT_EXEC), link (arg1 new link, arg2
+# target), exec (arg1 path; outcome is the landing profile, "unconfined", or
+# EACCES), chprof (arg1 target profile). Outcome KILL means the process was
+# SIGKILLed (kill-mode profile).
+#
+# What these rows pin down: a deny rule refuses silently; an audit rule logs
+# the ALLOWED access; owner rules deny non-owners loudly; "a" does not satisfy
+# a "w" request; mmap(PROT_EXEC) is operation "file_mmap" asking "m"; a link
+# names the new path and reports the target last; exec is operation "exec"
+# asking "x" alone, so bare "ix" works without "r"; ix inherits, px enters the
+# named profile, ux leaves confinement SILENTLY; an immediate change_profile
+# denial names the target profile in name= and carries no masks or uids;
+# complain mode allows and logs ALLOWED with the would-be denied mask; kill
+# mode logs KILLED and SIGKILLs. Probes DAC would refuse never reach AppArmor
+# and do not belong here. The two gvisor-root rows settle a production
+# question: no wildcard matches "/" itself ("/**" needs a character after the
+# slash), so opening the root directory is denied, loudly, unless the profile
+# grants "/ r" explicitly; a real kernel and this engine agree. The
+# gvisor-file rows pin the converse: bare "file" expands to /{**,}, which DOES
+# match "/", so a deny-list profile built on it opens the root directory
+# without a record. The engine once expanded it to /** alone, which cannot
+# match "/", and every such profile denied ls of the container root. The
+# attachtest rows pin attachment: its specification is one AARE expression
+# whose alternation attaches /tmp/at/a/bintest and /tmp/at/b/bintest on exec
+# from unconfined, while /tmp/at/c/bintest stays unconfined.
+#
+# Regenerate: load both profiles with apparmor_parser -r, create the fixtures
+# (owner-rule files chmod 666, cat copies for exec targets), probe under
+# aa-exec with python3 -S, read dmesg.
+open	gvisor-behav	/tmp/aa-behav/plain	r	1000	0	-	-	-
+open	gvisor-behav	/tmp/aa-behav/plain	w	1000	EACCES	2531611	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-behav" name="/tmp/aa-behav/plain" pid=2531611 comm="python3" requested_mask="w" denied_mask="w" fsuid=1000 ouid=1000
+open	gvisor-behav	/tmp/aa-behav/denied/f	r	1000	EACCES	-	-	-
+open	gvisor-behav	/tmp/aa-behav/owned/mine	w	1000	0	-	-	-
+open	gvisor-behav	/tmp/aa-behav/owned/roots	w	0	EACCES	2532125	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-behav" name="/tmp/aa-behav/owned/roots" pid=2532125 comm="python3" requested_mask="w" denied_mask="w" fsuid=1000 ouid=0
+open	gvisor-behav	/tmp/aa-behav/owned/roots	r	0	0	-	-	-
+open	gvisor-behav	/tmp/aa-behav/audited/f	r	1000	0	2531611	python3	apparmor="AUDIT" operation="open" class="file" profile="gvisor-behav" name="/tmp/aa-behav/audited/f" pid=2531611 comm="python3" requested_mask="r" fsuid=1000 ouid=1000
+open	gvisor-behav	/tmp/aa-behav/exact	w	1000	0	-	-	-
+open	gvisor-behav	/tmp/aa-behav/dir/	r	1000	0	-	-	-
+open	gvisor-behav2	/tmp/aa2/rdonly	r	1000	0	-	-	-
+open	gvisor-behav2	/tmp/aa2/rdonly	w	1000	EACCES	2545893	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-behav2" name="/tmp/aa2/rdonly" pid=2545893 comm="python3" requested_mask="w" denied_mask="w" fsuid=1000 ouid=1000
+openappend	gvisor-behav2	/tmp/aa2/append-only	a	1000	0	-	-	-
+open	gvisor-behav2	/tmp/aa2/append-only	w	1000	EACCES	2545893	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-behav2" name="/tmp/aa2/append-only" pid=2545893 comm="python3" requested_mask="w" denied_mask="w" fsuid=1000 ouid=1000
+open	gvisor-behav2	/tmp/aa2/dw	r	1000	0	-	-	-
+open	gvisor-behav2	/tmp/aa2/dw	w	1000	EACCES	-	-	-
+open	gvisor-behav2	/tmp/aa2/owner/mine	r	1000	0	-	-	-
+open	gvisor-behav2	/tmp/aa2/owner/roots	r	0	EACCES	2545893	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-behav2" name="/tmp/aa2/owner/roots" pid=2545893 comm="python3" requested_mask="r" denied_mask="r" fsuid=1000 ouid=0
+mmap	gvisor-behav2	/tmp/aa2/exec-map	m	1000	0	-	-	-
+mmap	gvisor-behav2	/tmp/aa2/noexec-map	m	1000	EACCES	2545893	python3	apparmor="DENIED" operation="file_mmap" class="file" profile="gvisor-behav2" name="/tmp/aa2/noexec-map" pid=2545893 comm="python3" requested_mask="m" denied_mask="m" fsuid=1000 ouid=1000
+link	gvisor-behav2	/tmp/aa2/lnew	/tmp/aa2/ltarget	1000	0	-	-	-
+link	gvisor-behav2	/tmp/aa2/lnew2	/tmp/aa2/ltarget	1000	EACCES	2545893	python3	apparmor="DENIED" operation="link" class="file" profile="gvisor-behav2" name="/tmp/aa2/lnew2" pid=2545893 comm="python3" requested_mask="l" denied_mask="l" fsuid=1000 ouid=1000 target="/tmp/aa2/ltarget"
+exec	gvisor-behav2	/tmp/aa2/bin/cat-ix	-	1000	gvisor-behav2	-	-	-
+exec	gvisor-behav2	/tmp/aa2/bin/cat-px	-	1000	gvisor-behav2-child	-	-	-
+exec	gvisor-behav2	/tmp/aa2/bin/cat-ux	-	1000	unconfined	-	-	-
+exec	gvisor-behav2	/tmp/aa2/bin/cat-noexec	-	1000	EACCES	2545898	python3	apparmor="DENIED" operation="exec" class="file" profile="gvisor-behav2" name="/tmp/aa2/bin/cat-noexec" pid=2545898 comm="python3" requested_mask="x" denied_mask="x" fsuid=1000 ouid=1000
+chprof	gvisor-behav2	gvisor-behav2-complain	-	1000	EACCES	2545893	python3	apparmor="DENIED" operation="change_profile" class="file" profile="gvisor-behav2" name="gvisor-behav2-complain" pid=2545893 comm="python3" target="gvisor-behav2-complain"
+chprof	gvisor-behav2	gvisor-behav2-child	-	1000	0	-	-	-
+open	gvisor-behav2-complain	/tmp/aa2/rdonly	r	1000	0	2545899	cat	apparmor="ALLOWED" operation="open" class="file" profile="gvisor-behav2-complain" name="/tmp/aa2/rdonly" pid=2545899 comm="cat" requested_mask="r" denied_mask="r" fsuid=1000 ouid=1000
+open	gvisor-behav2-kill	/tmp/aa2/rdonly	r	1000	KILL	2545900	cat	apparmor="KILLED" operation="open" class="file" profile="gvisor-behav2-kill" name="/tmp/aa2/rdonly" pid=2545900 comm="cat" requested_mask="r" denied_mask="r" fsuid=1000 ouid=1000
+open	gvisor-root-noslash	/	r	0	EACCES	2618931	python3	apparmor="DENIED" operation="open" class="file" profile="gvisor-root-noslash" name="/" pid=2618931 comm="python3" requested_mask="r" denied_mask="r" fsuid=1000 ouid=0
+open	gvisor-root-slash	/	r	0	0	-	-	-
+open	gvisor-file	/	r	0	0	-	-	-
+open	gvisor-file	/etc/hostname	r	0	0	-	-	-
+exec	-	/tmp/at/a/bintest	-	0	attachtest	-	-	-
+exec	-	/tmp/at/b/bintest	-	0	attachtest	-	-	-
+exec	-	/tmp/at/c/bintest	-	0	unconfined	-	-	-
