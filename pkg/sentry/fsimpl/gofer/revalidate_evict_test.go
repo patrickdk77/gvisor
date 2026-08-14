@@ -148,3 +148,175 @@ func TestRevalidateTTLCoversCachedDentry(t *testing.T) {
 		t.Error("allFresh() = true for a child older than the TTL")
 	}
 }
+
+// newNamedChild adds another child file to parent, so that a test can refill
+// the dentry cache after it has drained.
+func newNamedChild(ctx context.Context, t *testing.T, fs *filesystem, parent *dentry, controlFD lisafs.FDID, name string) *dentry {
+	t.Helper()
+	child, err := fs.newLisafsDentry(ctx, &lisafs.Inode{
+		ControlFD: controlFD,
+		Stat: lisafs.Statx{
+			Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_SIZE,
+			Mode: linux.S_IFREG | 0666,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newLisafsDentry(%s): %v", name, err)
+	}
+	parent.opMu.Lock()
+	parent.childrenMu.Lock()
+	parent.cacheNewChildLocked(child, name)
+	parent.childrenMu.Unlock()
+	parent.opMu.Unlock()
+	return child
+}
+
+// cacheChild drops the child's last reference, which is what an idle file's
+// dentry does: it lands in the dentry cache holding its host FDs open.
+func cacheChild(ctx context.Context, fs *filesystem, child *dentry) {
+	fs.renameMu.Lock()
+	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+	fs.renameMu.Unlock()
+}
+
+// cachedLen reports how many dentries are currently cached.
+func cachedLen(dc *dentryCache) uint64 {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.dentriesLen
+}
+
+// waitForCacheDrain waits for the sweeper to evict everything.
+func waitForCacheDrain(dc *dentryCache, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cachedLen(dc) == 0 {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return cachedLen(dc) == 0
+}
+
+// TestSweeperEvictsIdleDentry covers the basic contract of --dcache-ttl: a
+// dentry left unreferenced for the TTL is evicted, releasing its host FDs. This
+// is what keeps the sandbox from holding files open on an NFS server.
+func TestSweeperEvictsIdleDentry(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := newTestFS(ctx, 100)
+	fs.dentryCache.ttl = 200 * time.Millisecond
+	fs.dentryCache.startSweeper()
+	defer close(fs.dentryCache.sweeperStop)
+
+	parent, child := newTestChild(ctx, t, fs)
+	// Hold the parent, as an in-use directory does. Otherwise evicting the
+	// child drops the child's reference on its parent, the parent falls to
+	// zero references, and the sweeper evicts the directory too, which is
+	// correct but not what these tests are measuring.
+	parent.IncRef()
+	cacheChild(ctx, fs, child)
+	if got := cachedLen(fs.dentryCache); got != 1 {
+		t.Fatalf("cached dentries = %d, want 1", got)
+	}
+	// Not evicted before it has been idle for the TTL.
+	time.Sleep(20 * time.Millisecond)
+	if got := cachedLen(fs.dentryCache); got != 1 {
+		t.Errorf("cached dentries = %d after 20ms of a %v TTL, want 1", got, fs.dentryCache.ttl)
+	}
+	if !waitForCacheDrain(fs.dentryCache, 10*time.Second) {
+		t.Error("an idle dentry was never evicted, so its host FDs stay open for as long as the sandbox lives")
+	}
+}
+
+// TestSweeperWakesAfterCacheDrains is the regression test for the sweeper
+// parking instead of polling.
+//
+// The sweeper does no work while nothing is cached, so it has to be woken by
+// the insert that makes the cache non-empty again. If that wakeup is missed,
+// everything cached after the first drain is never evicted and the sandbox
+// holds those host FDs forever, which is worse than the polling it replaced and
+// invisible until an NFS server runs out of open files.
+func TestSweeperWakesAfterCacheDrains(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := newTestFS(ctx, 100)
+	fs.dentryCache.ttl = 200 * time.Millisecond
+	fs.dentryCache.startSweeper()
+	defer close(fs.dentryCache.sweeperStop)
+
+	parent, child := newTestChild(ctx, t, fs)
+	// Hold the parent, as an in-use directory does. Otherwise evicting the
+	// child drops the child's reference on its parent, the parent falls to
+	// zero references, and the sweeper evicts the directory too, which is
+	// correct but not what these tests are measuring.
+	parent.IncRef()
+	cacheChild(ctx, fs, child)
+	if !waitForCacheDrain(fs.dentryCache, 10*time.Second) {
+		t.Fatal("the first idle dentry was never evicted")
+	}
+
+	// The cache is empty and the sweeper is parked. Refill it.
+	for i, name := range []string{"second", "third"} {
+		next := newNamedChild(ctx, t, fs, parent, lisafs.FDID(10+i), name)
+		cacheChild(ctx, fs, next)
+		if !waitForCacheDrain(fs.dentryCache, 10*time.Second) {
+			t.Fatalf("dentry %q was never evicted after the cache had drained: the sweeper parked and was not woken", name)
+		}
+	}
+}
+
+// TestSweeperHonoursTTLPromptly covers the reason the sweeper sleeps to a
+// deadline rather than polling on an interval.
+//
+// It used to wake every ttl/4, floored at 10 seconds, so a dentry could hold
+// its host FDs for the TTL plus most of an interval. At the 15s used to keep
+// files from staying open on NFS that meant up to 25s, which is not what the
+// flag says.
+func TestSweeperHonoursTTLPromptly(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := newTestFS(ctx, 100)
+	const ttl = 300 * time.Millisecond
+	fs.dentryCache.ttl = ttl
+	fs.dentryCache.startSweeper()
+	defer close(fs.dentryCache.sweeperStop)
+
+	parent, child := newTestChild(ctx, t, fs)
+	// Hold the parent, as an in-use directory does. Otherwise evicting the
+	// child drops the child's reference on its parent, the parent falls to
+	// zero references, and the sweeper evicts the directory too, which is
+	// correct but not what these tests are measuring.
+	parent.IncRef()
+	start := time.Now()
+	cacheChild(ctx, fs, child)
+	if !waitForCacheDrain(fs.dentryCache, 10*time.Second) {
+		t.Fatal("an idle dentry was never evicted")
+	}
+	// Generous, because this is a scheduling deadline and not a hard
+	// guarantee. The point is that it is not a fixed 10s sweep interval.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("eviction took %v for a %v TTL; the sweeper is polling on an interval rather than sleeping to the entry's deadline", elapsed, ttl)
+	}
+}
+
+// TestNoSweeperWithoutTTL covers the default configuration, where no sweeper
+// runs at all. The insert path signals the sweeper through a channel that only
+// exists when there is one, so this also covers that the signal is safe when
+// there is not.
+func TestNoSweeperWithoutTTL(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := newTestFS(ctx, 100)
+	if fs.dentryCache.ttl != 0 {
+		t.Fatalf("ttl = %v, want 0 for this test", fs.dentryCache.ttl)
+	}
+	fs.dentryCache.startSweeper()
+	if fs.dentryCache.sweeperStop != nil || fs.dentryCache.notEmpty != nil {
+		t.Error("a sweeper was started for a zero TTL")
+	}
+
+	_, child := newTestChild(ctx, t, fs)
+	// Must not panic on the nil signal channel.
+	cacheChild(ctx, fs, child)
+	time.Sleep(50 * time.Millisecond)
+	if got := cachedLen(fs.dentryCache); got != 1 {
+		t.Errorf("cached dentries = %d, want 1: with no TTL a dentry is only evicted by size pressure", got)
+	}
+}

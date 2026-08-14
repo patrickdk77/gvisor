@@ -159,6 +159,11 @@ type dentryCache struct {
 	ttl time.Duration
 	// sweeperStop signals the background sweeper (if any) to exit.
 	sweeperStop chan struct{} `state:"nosave"`
+	// notEmpty wakes the sweeper when the cache goes from empty to
+	// non-empty. The sweeper parks on it rather than polling, so a cache
+	// holding nothing costs nothing. It is buffered so that the insert
+	// that fills the cache never blocks on the sweeper.
+	notEmpty chan struct{} `state:"nosave"`
 	// mu protects the below fields.
 	mu sync.Mutex `state:"nosave"`
 	// dentries contains all dentries with 0 references. Due to race conditions,
@@ -236,47 +241,77 @@ func (dc *dentryCache) startSweeper() {
 		return
 	}
 	dc.sweeperStop = make(chan struct{})
-	interval := dc.ttl / 4
-	if interval < 10*time.Second {
-		interval = 10 * time.Second
-	}
-	if interval > time.Minute {
-		interval = time.Minute
-	}
+	dc.notEmpty = make(chan struct{}, 1)
 	// S/R-SAFE: private-cache sweepers are stopped on filesystem
 	// release, and sweeper goroutines are not restarted after
 	// restore, so restored caches fall back to size-based eviction
 	// only.
-	go dc.sweep(interval)
+	go dc.sweep()
 }
 
-// sweep evicts stale cached dentries every interval until stopped.
-// The LRU list is ordered by last cache insertion (checkCachingLocked
-// refreshes cachedAt when moving an entry to the front), so eviction
-// stops at the first entry younger than the TTL.
-func (dc *dentryCache) sweep(interval time.Duration) {
+// sweep evicts cached dentries once they have gone unused for dc.ttl,
+// releasing their host FDs.
+//
+// It does no work while there is nothing to evict. The cache holds only
+// unreferenced dentries: checkCachingLocked() drops any whose reference count
+// has risen, and evictLocked() removes an entry before it looks at anything
+// else. So a sandbox whose files are all open, or whose cache has already been
+// emptied, leaves this parked on dc.notEmpty rather than waking on a timer and
+// taking dc.mu to find nothing, which on a node running hundreds of sandboxes
+// is a wakeup per cache per interval for no reason at all.
+//
+// When something is cached it sleeps until that entry is actually due instead
+// of polling, so the TTL is honoured to timer granularity. Polling made the
+// effective lifetime the TTL plus up to one interval, which for the 15s used to
+// keep host FDs off an NFS server meant closer to 25s.
+func (dc *dentryCache) sweep() {
 	ctx := context.Background()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	// One timer, reused: the sweeper may go around this loop once per
+	// evicted dentry.
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
 	for {
-		select {
-		case <-dc.sweeperStop:
-			return
-		case <-ticker.C:
+		dc.mu.Lock()
+		// The LRU list is ordered by last use (checkCachingLocked
+		// refreshes cachedAt when it moves an entry to the front), so
+		// the back is the only entry that can be due.
+		victim := dc.dentries.Back()
+		var idle time.Duration
+		if victim != nil {
+			idle = time.Duration(cacheNowNanos() - victim.d.cachedAt.Load())
 		}
-		for {
-			dc.mu.Lock()
-			victim := dc.dentries.Back()
-			stale := victim != nil &&
-				cacheNowNanos()-victim.d.cachedAt.Load() >= dc.ttl.Nanoseconds()
-			dc.mu.Unlock()
-			if !stale {
-				break
+		dc.mu.Unlock()
+
+		switch {
+		case victim == nil:
+			// Nothing is cached. Park until something is.
+			select {
+			case <-dc.sweeperStop:
+				return
+			case <-dc.notEmpty:
 			}
+
+		case idle >= dc.ttl:
 			// evict() re-checks refs and watches under the
 			// appropriate locks, so racing ref-takers and
 			// already-destroyed dentries are handled safely.
 			victim.d.evict(ctx)
+
+		default:
+			// Sleep until the oldest entry is due. Anything cached
+			// in the meantime is younger and cannot come due first,
+			// and anything removed in the meantime only leaves a
+			// younger entry at the back, so this cannot oversleep.
+			timer.Reset(dc.ttl - idle)
+			select {
+			case <-dc.sweeperStop:
+				return
+			case <-timer.C:
+			}
 		}
 	}
 }
@@ -1901,6 +1936,18 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 	d.inode.fs.dentryCache.dentries.PushFront(&d.cacheEntry)
 	d.inode.fs.dentryCache.dentriesLen++
 	d.cached = true
+	if d.inode.fs.dentryCache.dentriesLen == 1 {
+		// The cache just became non-empty. Wake the sweeper, which
+		// parks while there is nothing to evict rather than waking on
+		// a timer to find an empty cache. The send never blocks: the
+		// channel is buffered, and a signal already pending is one the
+		// sweeper has not consumed yet. It is nil when no sweeper runs
+		// (a zero TTL), which the default case covers.
+		select {
+		case d.inode.fs.dentryCache.notEmpty <- struct{}{}:
+		default:
+		}
+	}
 	shouldEvict := d.inode.fs.dentryCache.dentriesLen > d.inode.fs.dentryCache.maxCachedDentries
 	d.inode.fs.dentryCache.mu.Unlock()
 	d.cachingMu.Unlock()
