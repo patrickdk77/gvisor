@@ -361,7 +361,7 @@ func TestParseChangeProfileDeny(t *testing.T) {
 	const profile = `
 profile p {
   change_profile -> cage*,
-  deny change_profile -> jailroot,
+  deny change_profile -> cageroot,
   audit change_profile -> audited,
 }
 
@@ -384,7 +384,7 @@ profile s {
 	for name, want := range map[string][]confine.ChangeRule{
 		"p": {
 			{Pattern: "cage*"},
-			{Pattern: "jailroot", Deny: true},
+			{Pattern: "cageroot", Deny: true},
 			{Pattern: "audited"},
 		},
 		// A bare deny refuses every transition.
@@ -521,8 +521,8 @@ profile p {
   /bin/inherit mixr,
   /bin/unconfined mrUx,
   /bin/lower mrux,
-  /bin/named mrpx -> jail,
-  /bin/scrubbed mrPx -> jail,
+  /bin/named mrpx -> cage,
+  /bin/scrubbed mrPx -> cage,
   /bin/kid mrcx -> kid,
   deny /bin/denied mrix,
   /etc/passwd r,
@@ -542,8 +542,8 @@ profile p {
 		{Pattern: "/bin/inherit", Mode: confine.ExecInherit},
 		{Pattern: "/bin/unconfined", Mode: confine.ExecUnconfined, Scrub: true},
 		{Pattern: "/bin/lower", Mode: confine.ExecUnconfined},
-		{Pattern: "/bin/named", Mode: confine.ExecProfile, Target: "jail"},
-		{Pattern: "/bin/scrubbed", Mode: confine.ExecProfile, Target: "jail", Scrub: true},
+		{Pattern: "/bin/named", Mode: confine.ExecProfile, Target: "cage"},
+		{Pattern: "/bin/scrubbed", Mode: confine.ExecProfile, Target: "cage", Scrub: true},
 		{Pattern: "/bin/kid", Mode: confine.ExecChild, Target: "kid"},
 	}
 	if !reflect.DeepEqual(cp.ExecRules, want) {
@@ -664,7 +664,7 @@ func TestPathAndVariableSyntax(t *testing.T) {
 }
 
 // TestNamedProfileAttachment covers a profile whose attachment path is given
-// separately from its name, "profile jail /bin/cagebash {", which attaches on
+// separately from its name, "profile cage /bin/cagebash {", which attaches on
 // exec of that path just as "profile /bin/cagebash {" does.
 // TestAttachmentSpecifications covers every form an attachment can take. The
 // specification is one AARE expression: alternations and variables give it
@@ -714,6 +714,19 @@ func TestAttachmentSpecifications(t *testing.T) {
 			},
 		},
 		{
+			// Kernel-verified: all four attach to cagesh, a fifth
+			// binary beside them stays unconfined.
+			name: "two brace groups attach their cartesian product",
+			policy: "profile cagesh /{bin,usr/bin}/{cagebash,cagedash} {\n" +
+				"  /etc/passwd r,\n}\n",
+			want: map[string]string{
+				"/bin/cagebash":     "cagesh",
+				"/bin/cagedash":     "cagesh",
+				"/usr/bin/cagebash": "cagesh",
+				"/usr/bin/cagedash": "cagesh",
+			},
+		},
+		{
 			name:   "comma is not a list separator and attaches nothing real",
 			policy: "profile cagebash /bin/cagebash,/usr/bin/cagebash {\n  /etc/passwd r,\n}\n",
 			// One literal key containing a comma, which no exec path ever
@@ -758,12 +771,12 @@ func TestAttachmentSpecifications(t *testing.T) {
 
 func TestNamedProfileAttachment(t *testing.T) {
 	policy := &AppArmorPolicy{}
-	const p = "profile jail /bin/cagebash flags=(attach_disconnected) {\n  /etc/passwd r,\n}\nprofile /bin/cagedash {\n  /etc/passwd r,\n}\nprofile plain {\n  /etc/passwd r,\n}\n"
+	const p = "profile cage /bin/cagebash flags=(attach_disconnected) {\n  /etc/passwd r,\n}\nprofile /bin/cagedash {\n  /etc/passwd r,\n}\nprofile plain {\n  /etc/passwd r,\n}\n"
 	if err := ParseAppArmorProfiles(strings.NewReader(p), "t", policy, make(tunables)); err != nil {
 		t.Fatalf("ParseAppArmorProfiles: %v", err)
 	}
 	want := map[string]string{
-		"/bin/cagebash": "jail",
+		"/bin/cagebash": "cage",
 		"/bin/cagedash": "/bin/cagedash",
 	}
 	if !reflect.DeepEqual(policy.ExecAttach, want) {
