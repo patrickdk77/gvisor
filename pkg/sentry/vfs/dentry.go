@@ -305,6 +305,9 @@ func (vfs *VirtualFilesystem) AbortRenameDentry(from, to *Dentry) {
 // +checklocksrelease:from.mu
 // +checklocksrelease:to.mu
 func (vfs *VirtualFilesystem) CommitRenameReplaceDentry(ctx context.Context, from, to *Dentry) []refs.RefCounter {
+	// A rename above a mount point changes the pathnames mountinfo reports
+	// for it, with no mount operation involved.
+	vfs.invalidateMountInfo()
 	from.mu.Unlock()
 	if to != nil {
 		to.dead = true
@@ -323,6 +326,9 @@ func (vfs *VirtualFilesystem) CommitRenameReplaceDentry(ctx context.Context, fro
 // +checklocksrelease:from.mu
 // +checklocksrelease:to.mu
 func (vfs *VirtualFilesystem) CommitRenameExchangeDentry(from, to *Dentry) {
+	// A rename above a mount point changes the pathnames mountinfo reports
+	// for it, with no mount operation involved.
+	vfs.invalidateMountInfo()
 	from.mu.Unlock()
 	to.mu.Unlock()
 }

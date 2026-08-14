@@ -65,6 +65,14 @@ type VirtualFilesystem struct {
 	// mountMu is analogous to Linux's namespace_sem.
 	mountMu virtualFilesystemMutex `state:"nosave"`
 
+	// mountInfoGen changes whenever anything /proc/[pid]/mountinfo reports
+	// changes, which is what lets a generated mountinfo be reused. It covers
+	// more than mount mutations: fields 4 and 5 are pathnames, so renaming a
+	// directory above a mount point changes the output with no mount
+	// operation involved. Every site that bumps it is listed at
+	// invalidateMountInfo().
+	mountInfoGen atomicbitops.Uint64
+
 	// mounts maps (mount parent, mount point) pairs to mounts. (Since mounts
 	// are uniquely namespaced, including mount parent in the key correctly
 	// handles both bind mounts and mount namespaces; Linux does the same.)

@@ -520,6 +520,10 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:mountinfo_test",
+)
+
+syscall_test(
     add_hostinet = True,
     netstack_sr = True,
     test = "//test/syscalls/linux:packet_socket_dgram_test",

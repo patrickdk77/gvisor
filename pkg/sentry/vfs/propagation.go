@@ -142,6 +142,8 @@ func (vfs *VirtualFilesystem) SetMountPropagation(mnt *Mount, propFlag uint32, r
 //
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) setPropagation(mnt *Mount, propFlags uint32) {
+	// Propagation prints as the "shared:" and "master:" optional fields.
+	vfs.invalidateMountInfo()
 	if propFlags == linux.MS_SHARED {
 		mnt.isShared = true
 		return
@@ -490,6 +492,8 @@ func (vfs *VirtualFilesystem) cleanupGroupIDs(mnts []*Mount) {
 //
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) allocMountGroupIDs(mnt *Mount, recursive bool) error {
+	// Group IDs print as the numbers in "shared:" and "master:".
+	vfs.invalidateMountInfo()
 	var mnts []*Mount
 	if recursive {
 		mnts = mnt.submountsLocked()

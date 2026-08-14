@@ -402,5 +402,6 @@ func (mntns *MountNamespace) notify() {
 	if mntns == nil {
 		return
 	}
+	mntns.vfs.invalidateMountInfo()
 	mntns.Poller.Notify()
 }

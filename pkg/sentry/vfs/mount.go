@@ -112,6 +112,38 @@ type Mount struct {
 	// Mount. children is protected by VirtualFilesystem.mountMu.
 	children map[*Mount]struct{}
 
+	// mountInfoMu guards the cached mountinfo below.
+	mountInfoMu mountInfoMutex `state:"nosave"`
+
+	// cachedMountInfo is a previously generated /proc/[pid]/mountinfo for a
+	// task whose root is this mount's root, valid while
+	// VirtualFilesystem.mountInfoGen still equals cachedMountInfoGen. It is
+	// nil when nothing is cached.
+	//
+	// It is keyed on this mount because root is immutable and lives as long as
+	// the mount does, so the key needs no reference of its own, and because
+	// every task sharing a root shares the cache: in a container that is every
+	// process, which is what makes reuse worth having.
+	//
+	// +checklocks:mountInfoMu
+	cachedMountInfo []byte
+
+	// +checklocks:mountInfoMu
+	cachedMountInfoGen uint64
+
+	// cachedDev holds the device number of this mount's root, which
+	// /proc/[pid]/mountinfo reports and which does not change while the mount
+	// exists: root is immutable, and a file does not move between devices.
+	// The low 32 bits are the minor number, the next 32 the major, and the
+	// value is zero until it has been looked up. See mountDevice().
+	//
+	// Linux reads this from super_block::s_dev; the sentry has to ask the
+	// filesystem, and doing so on every read of mountinfo costs a full path
+	// operation per mount per read. It is cached per mount rather than per
+	// filesystem because a single gofer mount can span several devices, so
+	// two mounts of one filesystem need not share a device.
+	cachedDev atomicbitops.Uint64
+
 	// isShared indicates this mount has the MS_SHARED propagation type.
 	isShared bool
 
@@ -1528,7 +1560,22 @@ func (mnt *Mount) EndWrite() {
 }
 
 // Preconditions: VirtualFilesystem.mountMu must be locked.
+// invalidateMountInfo records that something /proc/[pid]/mountinfo reports has
+// changed, so that a generated copy is not reused.
+//
+// It is bumped by MountNamespace.notify() for mounting, unmounting, moving and
+// remounting; by setPropagation() and allocMountGroupIDs() for the "shared:"
+// and "master:" fields; by Mount.setReadOnlyLocked() for "ro"/"rw"; by the
+// rename commit points, because fields 4 and 5 are pathnames that a rename
+// above a mount point changes; and when a mount promise resolves, which turns
+// a placeholder line into a real one.
+func (vfs *VirtualFilesystem) invalidateMountInfo() {
+	vfs.mountInfoGen.Add(1)
+}
+
 func (mnt *Mount) setReadOnlyLocked(ro bool) error {
+	// The read-only flag prints as "ro"/"rw" in the mount options.
+	mnt.vfs.invalidateMountInfo()
 	if oldRO := mnt.writers.Load() < 0; oldRO == ro {
 		return nil
 	}
@@ -1673,10 +1720,80 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 // buf.
 //
 // Preconditions: taskRootDir.Ok().
+// cachedMountInfoFor returns a previously generated mountinfo for a task rooted
+// at mnt's root if it is still valid for gen, or nil.
+func (mnt *Mount) cachedMountInfoFor(gen uint64) []byte {
+	mnt.mountInfoMu.Lock()
+	defer mnt.mountInfoMu.Unlock()
+	if mnt.cachedMountInfo == nil || mnt.cachedMountInfoGen != gen {
+		return nil
+	}
+	return mnt.cachedMountInfo
+}
+
+// cacheMountInfoFor stores a generated mountinfo for reuse while gen is
+// current. buf is copied, since the caller reuses its buffer.
+func (mnt *Mount) cacheMountInfoFor(gen uint64, buf []byte) {
+	stored := make([]byte, len(buf))
+	copy(stored, buf)
+	mnt.mountInfoMu.Lock()
+	defer mnt.mountInfoMu.Unlock()
+	mnt.cachedMountInfo = stored
+	mnt.cachedMountInfoGen = gen
+}
+
+// mountDevice returns the device numbers of mnt's root, which
+// /proc/[pid]/mountinfo reports.
+//
+// The answer is looked up once and remembered on the mount. Linux reads it
+// from super_block::s_dev, a field access; the sentry has to ask the
+// filesystem, which is a whole path operation, and generating mountinfo does
+// it once per mount. A workload that reads mountinfo in a loop, as container
+// tooling does, otherwise pays that for every mount on every read, while the
+// answer cannot change: a mount's root is immutable and a file does not move
+// between devices.
+func (vfs *VirtualFilesystem) mountDevice(ctx context.Context, creds *auth.Credentials, mnt *Mount, mntRootVD VirtualDentry) (uint32, uint32, error) {
+	if dev := mnt.cachedDev.Load(); dev != 0 {
+		return uint32(dev >> 32), uint32(dev), nil
+	}
+	statx, err := vfs.StatAt(ctx, creds, &PathOperation{
+		Root:  mntRootVD,
+		Start: mntRootVD,
+	}, &StatOptions{
+		// Linux's fs/proc_namespace.c:show_mountinfo() just reads
+		// super_block::s_dev directly.
+		Sync: linux.AT_STATX_DONT_SYNC,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	// A device of 0:0 is left uncached rather than given a validity bit of
+	// its own: it means the filesystem reported no device, so there is
+	// nothing to save by remembering it.
+	mnt.cachedDev.Store(uint64(statx.DevMajor)<<32 | uint64(statx.DevMinor))
+	return statx.DevMajor, statx.DevMinor, nil
+}
+
 func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRootDir VirtualDentry, buf *bytes.Buffer) error {
 	rootMnt := taskRootDir.mount
 
 	vfs.lockMounts()
+	// Generating this costs two pathname walks per mount, so reuse a previous
+	// copy while nothing it reports has changed. Only a task whose root is the
+	// namespace root can use it, which is every task in a container; a
+	// chrooted task sees different pathnames and generates its own.
+	gen := vfs.mountInfoGen.Load()
+	// A task rooted anywhere other than its mount's root sees different
+	// pathnames, so only the common case, where it is that root, is cached.
+	cacheable := taskRootDir.dentry == rootMnt.root
+	if cacheable {
+		if cached := rootMnt.cachedMountInfoFor(gen); cached != nil {
+			vfs.unlockMounts(ctx)
+			buf.Write(cached)
+			return nil
+		}
+	}
+
 	mounts := rootMnt.submountsLocked()
 	// Take a reference on mounts since we need to drop vfs.mountMu before
 	// calling vfs.PathnameReachable() (=> FilesystemImpl.PrependPath()) or
@@ -1737,16 +1854,8 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 			fmt.Fprintf(buf, "0 0 0:0 %s %s promise - promise none promise\n", manglePath(pathFromFS), manglePath(pathFromRoot))
 			continue
 		}
-		// Stat the mount root to get the major/minor device numbers.
-		pop := &PathOperation{
-			Root:  mntRootVD,
-			Start: mntRootVD,
-		}
-		statx, err := vfs.StatAt(ctx, creds, pop, &StatOptions{
-			// Linux's fs/proc_namespace.c:show_mountinfo() just reads
-			// super_block::s_dev directly.
-			Sync: linux.AT_STATX_DONT_SYNC,
-		})
+		// Get the major/minor device numbers of the mount root.
+		devMajor, devMinor, err := vfs.mountDevice(ctx, creds, mnt, mntRootVD)
 		if err != nil {
 			// Well that's not good. Ignore this mount.
 			ctx.Warningf("VFS.GenerateProcMountInfo: failed to stat mount root: %v", err)
@@ -1772,7 +1881,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 
 		// (3) Major:Minor device ID. We don't have a superblock, so we
 		// just use the root inode device number.
-		fmt.Fprintf(buf, "%d:%d ", statx.DevMajor, statx.DevMinor)
+		fmt.Fprintf(buf, "%d:%d ", devMajor, devMinor)
 
 		// (4) Root: the pathname of the directory in the filesystem
 		// which forms the root of this mount.
@@ -1810,6 +1919,12 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 
 		// (11) Superblock options, and final newline.
 		fmt.Fprintf(buf, "%s\n", superBlockOpts(pathFromRoot, mnt))
+	}
+	if cacheable {
+		// Store against the generation read before generating, so that a
+		// change made while generating leaves this copy invalid rather than
+		// letting it be served.
+		rootMnt.cacheMountInfoFor(gen, buf.Bytes())
 	}
 	return nil
 }
