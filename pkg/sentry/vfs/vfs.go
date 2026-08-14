@@ -224,6 +224,16 @@ type PathOperation struct {
 	// path component represents a symbolic link, the symbolic link should be
 	// followed.
 	FollowFinalSymlink bool
+
+	// Resolve restricts how the path may be resolved, as a bitmask of
+	// openat2(2)'s RESOLVE_* constants. Zero, the value for every operation
+	// other than openat2(2), imposes no restriction.
+	//
+	// RESOLVE_IN_ROOT and RESOLVE_BENEATH are not represented here: both are
+	// expressed by setting Root to the directory resolution must not escape,
+	// and only RESOLVE_BENEATH, which refuses to escape rather than clamping
+	// at the root, needs a bit of its own.
+	Resolve uint64
 }
 
 // AccessAt checks whether a user with creds has access to the file at

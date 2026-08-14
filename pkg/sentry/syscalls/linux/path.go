@@ -82,6 +82,52 @@ func getTaskPathOperation(t *kernel.Task, dirfd int32, path fspath.Path, emptyPa
 	}, nil
 }
 
+// getTaskPathOperationRootedAtDirfd is getTaskPathOperation() for openat2(2)'s
+// RESOLVE_IN_ROOT and RESOLVE_BENEATH, which resolve with dirfd itself as the
+// root: "/" and ".." both stop there, and an absolute symlink restarts there
+// rather than at the process's root.
+//
+// Unlike getTaskPathOperation(), dirfd is resolved even for an absolute
+// pathname, because under these flags an absolute pathname is resolved
+// relative to dirfd (RESOLVE_IN_ROOT) or refused (RESOLVE_BENEATH) instead of
+// starting at the process's root.
+func getTaskPathOperationRootedAtDirfd(t *kernel.Task, dirfd int32, path fspath.Path, shouldFollowFinalSymlink shouldFollowFinalSymlink, resolve uint64) (taskPathOperation, error) {
+	if path.Absolute && resolve&linux.RESOLVE_BENEATH != 0 {
+		// An absolute pathname leaves dirfd by definition.
+		return taskPathOperation{}, linuxerr.EXDEV
+	}
+	// An empty pathname is ENOENT, as for openat(2) without AT_EMPTY_PATH.
+	// "/" is not empty: it names the root itself, which here is dirfd.
+	if !path.Absolute && !path.HasComponents() {
+		return taskPathOperation{}, linuxerr.ENOENT
+	}
+
+	var root vfs.VirtualDentry
+	if dirfd == linux.AT_FDCWD {
+		root = t.FSContext().WorkingDirectory()
+	} else {
+		dirfile := t.GetFile(dirfd)
+		if dirfile == nil {
+			return taskPathOperation{}, linuxerr.EBADF
+		}
+		root = dirfile.VirtualDentry()
+		root.IncRef()
+		dirfile.DecRef(t)
+	}
+	return taskPathOperation{
+		pop: vfs.PathOperation{
+			Root:               root,
+			Start:              root,
+			Path:               path,
+			FollowFinalSymlink: bool(shouldFollowFinalSymlink),
+			Resolve:            resolve,
+		},
+		// Root and Start are the same VirtualDentry holding a single
+		// reference, which Release() drops through Root.
+		haveStartRef: false,
+	}, nil
+}
+
 func (tpop *taskPathOperation) Release(t *kernel.Task) {
 	tpop.pop.Root.DecRef(t)
 	if tpop.haveStartRef {

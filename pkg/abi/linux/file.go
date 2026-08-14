@@ -43,6 +43,67 @@ const (
 	O_TMPFILE  = 020000000 // __O_TMPFILE in Linux
 )
 
+// ValidOpenFlags is the set of flags open(2) defines, VALID_OPEN_FLAGS in
+// Linux. open(2) ignores bits outside it; openat2(2) rejects them, which is
+// how a caller can tell whether the kernel understood what it asked for.
+//
+// The arch-dependent values come from file_amd64.go and file_arm64.go, where
+// they differ between architectures.
+const ValidOpenFlags = O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
+	O_APPEND | O_NONBLOCK | O_DSYNC | O_ASYNC | O_DIRECT | O_LARGEFILE |
+	O_DIRECTORY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC | O_SYNC | O_PATH |
+	O_TMPFILE
+
+// Constants for openat2(2)'s open_how.resolve.
+const (
+	// RESOLVE_NO_XDEV forbids traversing mount points, in either direction.
+	RESOLVE_NO_XDEV = 0x01
+
+	// RESOLVE_NO_MAGICLINKS forbids traversing "magic" links such as
+	// /proc/[pid]/fd/[fd], which jump elsewhere in the filesystem without
+	// being symlinks.
+	RESOLVE_NO_MAGICLINKS = 0x02
+
+	// RESOLVE_NO_SYMLINKS forbids traversing symlinks of any kind. It
+	// implies RESOLVE_NO_MAGICLINKS.
+	RESOLVE_NO_SYMLINKS = 0x04
+
+	// RESOLVE_BENEATH forbids resolution from escaping the starting
+	// directory, by any of "..", an absolute path, or an absolute symlink.
+	RESOLVE_BENEATH = 0x08
+
+	// RESOLVE_IN_ROOT resolves the path as though the starting directory
+	// were the root directory, so that neither ".." nor an absolute path
+	// nor an absolute symlink can escape it.
+	RESOLVE_IN_ROOT = 0x10
+
+	// RESOLVE_CACHED forbids any operation that would block, so that a
+	// lookup either completes from cache or fails with EAGAIN.
+	RESOLVE_CACHED = 0x20
+)
+
+// ValidResolveFlags is the set of open_how.resolve bits openat2(2) defines.
+// Bits outside it are rejected with EINVAL.
+const ValidResolveFlags = RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS |
+	RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED
+
+// OpenHow is struct open_how, the argument of openat2(2).
+//
+// +marshal
+type OpenHow struct {
+	// Flags is the open flags, as passed to openat(2). Unlike openat(2),
+	// every bit is validated.
+	Flags uint64
+
+	// Mode is the file mode for a newly created file. It must be zero
+	// unless Flags contains O_CREAT or O_TMPFILE.
+	Mode uint64
+
+	// Resolve restricts how the path is resolved; see the RESOLVE_*
+	// constants.
+	Resolve uint64
+}
+
 // Constants for file mode (struct file::f_mode in Linux).
 const (
 	// FMODE_READ indicates the file is open for reading.

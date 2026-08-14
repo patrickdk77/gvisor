@@ -66,6 +66,16 @@ const (
 	rpflagsHaveMountRef       = 1 << iota // do we hold a reference on mount?
 	rpflagsHaveStartRef                   // do we hold a reference on start?
 	rpflagsFollowFinalSymlink             // same as PathOperation.FollowFinalSymlink
+
+	// The remaining flags are the openat2(2) resolution restrictions, from
+	// PathOperation.Resolve. They live in this bitfield rather than in
+	// fields of their own so that every path resolution in the sandbox,
+	// almost none of which set them, pays nothing but a bit test on a word
+	// it already touches.
+	rpflagsNoXDev       // RESOLVE_NO_XDEV: no traversing mount points
+	rpflagsNoMagicLinks // RESOLVE_NO_MAGICLINKS: no traversing magic links
+	rpflagsNoSymlinks   // RESOLVE_NO_SYMLINKS: no traversing symlinks
+	rpflagsBeneath      // RESOLVE_BENEATH: escaping the root is an error
 )
 
 func init() {
@@ -124,6 +134,24 @@ func (vfs *VirtualFilesystem) getResolvingPath(creds *auth.Credentials, pop *Pat
 	rp.flags = 0
 	if pop.FollowFinalSymlink {
 		rp.flags |= rpflagsFollowFinalSymlink
+	}
+	if pop.Resolve != 0 {
+		if pop.Resolve&linux.RESOLVE_NO_XDEV != 0 {
+			rp.flags |= rpflagsNoXDev
+		}
+		// RESOLVE_NO_SYMLINKS implies RESOLVE_NO_MAGICLINKS.
+		if pop.Resolve&(linux.RESOLVE_NO_MAGICLINKS|linux.RESOLVE_NO_SYMLINKS) != 0 {
+			rp.flags |= rpflagsNoMagicLinks
+		}
+		if pop.Resolve&linux.RESOLVE_NO_SYMLINKS != 0 {
+			rp.flags |= rpflagsNoSymlinks
+		}
+		// RESOLVE_IN_ROOT and RESOLVE_BENEATH both resolve with Root set to
+		// the starting directory, which is what confines them; they differ
+		// only in whether trying to escape it is clamped or refused.
+		if pop.Resolve&linux.RESOLVE_BENEATH != 0 {
+			rp.flags |= rpflagsBeneath
+		}
 	}
 	rp.mustBeDir = pop.Path.Dir
 	rp.symlinks = 0
@@ -286,12 +314,22 @@ func (rp *ResolvingPath) GetComponents(excludeLast bool, emit func(string) bool)
 func (rp *ResolvingPath) CheckRoot(ctx context.Context, d *Dentry) (bool, error) {
 	if d == rp.root.dentry && rp.mount == rp.root.mount {
 		// At contextual VFS root (due to e.g. chroot(2)).
+		if rp.flags&rpflagsBeneath != 0 {
+			// RESOLVE_BENEATH: ".." here would leave the directory
+			// resolution started from, which is refused rather than
+			// clamped as it is for RESOLVE_IN_ROOT and chroot(2).
+			return false, linuxerr.EXDEV
+		}
 		return true, nil
 	} else if d == rp.mount.root {
 		// At mount root ...
 		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root)
 		if vd.Ok() {
 			// ... of non-root mount.
+			if rp.flags&rpflagsNoXDev != 0 {
+				// RESOLVE_NO_XDEV: leaving this mount by "..".
+				return false, linuxerr.EXDEV
+			}
 			rp.nextMount = vd.mount
 			rp.nextStart = vd.dentry
 			return false, resolveMountRootOrJumpError{}
@@ -311,6 +349,10 @@ func (rp *ResolvingPath) CheckMount(ctx context.Context, d *Dentry) error {
 		return nil
 	}
 	if mnt := rp.vfs.getMountAt(ctx, rp.mount, d); mnt != nil {
+		if rp.flags&rpflagsNoXDev != 0 {
+			// RESOLVE_NO_XDEV: entering a mount.
+			return linuxerr.EXDEV
+		}
 		rp.nextMount = mnt
 		return resolveMountPointError{}
 	}
@@ -351,6 +393,13 @@ func (rp *ResolvingPath) ShouldFollowSymlink() bool {
 //
 // Postconditions: If HandleSymlink returns a nil error, then !rp.Done().
 func (rp *ResolvingPath) HandleSymlink(target string) (bool, error) {
+	if rp.flags&rpflagsNoSymlinks != 0 {
+		// RESOLVE_NO_SYMLINKS. Note that this is only reached for a
+		// symlink that would be followed: with O_NOFOLLOW the final
+		// component is not resolved, which is how openat2(2) can still
+		// return an O_PATH descriptor for the link itself.
+		return false, linuxerr.ELOOP
+	}
 	if rp.symlinks >= linux.MaxSymlinkTraversals {
 		return false, linuxerr.ELOOP
 	}
@@ -360,6 +409,13 @@ func (rp *ResolvingPath) HandleSymlink(target string) (bool, error) {
 	rp.symlinks++
 	targetPath := fspath.Parse(target)
 	if targetPath.Absolute {
+		if rp.flags&rpflagsBeneath != 0 {
+			// RESOLVE_BENEATH: an absolute symlink leaves the
+			// directory resolution started from. RESOLVE_IN_ROOT
+			// needs nothing here, because restarting at rp.root is
+			// already restarting at that directory.
+			return false, linuxerr.EXDEV
+		}
 		rp.absSymlinkTarget = targetPath
 		return true, resolveAbsSymlinkError{}
 	}
@@ -403,6 +459,10 @@ func (rp *ResolvingPath) relpathPrepend(path fspath.Path) {
 //
 // Preconditions: !rp.Done().
 func (rp *ResolvingPath) HandleJump(target VirtualDentry) (bool, error) {
+	if rp.flags&rpflagsNoMagicLinks != 0 {
+		// RESOLVE_NO_MAGICLINKS, which RESOLVE_NO_SYMLINKS implies.
+		return false, linuxerr.ELOOP
+	}
 	if rp.symlinks >= linux.MaxSymlinkTraversals {
 		return false, linuxerr.ELOOP
 	}

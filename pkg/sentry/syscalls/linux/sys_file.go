@@ -131,6 +131,119 @@ func openat(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr, flags uint32, m
 	return uintptr(fd), nil, err
 }
 
+// Openat2 implements Linux syscall openat2(2).
+func Openat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	dirfd := args[0].Int()
+	pathAddr := args[1].Pointer()
+	howAddr := args[2].Pointer()
+	size := args[3].SizeT()
+
+	var how linux.OpenHow
+	howSize := uint(how.SizeBytes())
+	if size < howSize {
+		// Smaller than the first version of the structure, so it cannot
+		// even carry the fields every kernel has.
+		return 0, nil, linuxerr.EINVAL
+	}
+	if _, err := how.CopyIn(t, howAddr); err != nil {
+		return 0, nil, err
+	}
+	if size > howSize {
+		// An extension this implementation does not know. It is tolerated
+		// only if the caller left it zeroed, which means it is not asking
+		// for anything; otherwise the request cannot be honoured as
+		// written and must be refused rather than silently narrowed.
+		zeroed, err := isZeroedUser(t, howAddr+hostarch.Addr(howSize), size-howSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !zeroed {
+			return 0, nil, linuxerr.E2BIG
+		}
+	}
+
+	// openat2(2) validates strictly, where open(2) ignores what it does not
+	// understand. That is the point of the syscall: a caller can tell
+	// whether the restriction it asked for was applied.
+	if how.Flags&^uint64(linux.ValidOpenFlags) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if how.Resolve&^uint64(linux.ValidResolveFlags) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if how.Flags&(linux.O_CREAT|linux.O_TMPFILE) != 0 {
+		if how.Mode&^uint64(0o7777) != 0 {
+			return 0, nil, linuxerr.EINVAL
+		}
+	} else if how.Mode != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if how.Resolve&linux.RESOLVE_CACHED != 0 {
+		// RESOLVE_CACHED means resolve without any operation that could
+		// block. The sentry cannot promise that: a lookup may need an RPC
+		// to the gofer, and answering from the dentry cache alone would
+		// mean guessing about what the remote filesystem holds. EAGAIN is
+		// the answer the interface defines for exactly this, and callers
+		// are required to handle it by retrying without the flag.
+		return 0, nil, linuxerr.EAGAIN
+	}
+
+	path, err := copyInPath(t, pathAddr)
+	if err != nil {
+		return 0, nil, err
+	}
+	follow := shouldFollowFinalSymlink(how.Flags&linux.O_NOFOLLOW == 0)
+	var tpop taskPathOperation
+	if how.Resolve&(linux.RESOLVE_IN_ROOT|linux.RESOLVE_BENEATH) != 0 {
+		tpop, err = getTaskPathOperationRootedAtDirfd(t, dirfd, path, follow, how.Resolve)
+	} else {
+		tpop, err = getTaskPathOperation(t, dirfd, path, disallowEmptyPath, follow)
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tpop.Release(t)
+	tpop.pop.Resolve = how.Resolve
+
+	file, err := t.Kernel().VFS().OpenAt(t, t.Credentials(), &tpop.pop, &vfs.OpenOptions{
+		Flags: uint32(how.Flags) | linux.O_LARGEFILE,
+		Mode:  linux.FileMode(how.Mode & (0777 | linux.S_ISUID | linux.S_ISGID | linux.S_ISVTX) &^ uint64(t.FSContext().Umask())),
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	defer file.DecRef(t)
+
+	fd, err := t.NewFDFrom(0, file, kernel.FDFlags{
+		CloseOnExec: how.Flags&linux.O_CLOEXEC != 0,
+	})
+	return uintptr(fd), nil, err
+}
+
+// isZeroedUser reports whether length bytes at addr are all zero. It reads in
+// chunks so that a caller passing an enormous size cannot make the sentry
+// allocate to match.
+func isZeroedUser(t *kernel.Task, addr hostarch.Addr, length uint) (bool, error) {
+	var buf [64]byte
+	for length > 0 {
+		n := uint(len(buf))
+		if n > length {
+			n = length
+		}
+		if _, err := t.CopyInBytes(addr, buf[:n]); err != nil {
+			return false, err
+		}
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return false, nil
+			}
+		}
+		addr += hostarch.Addr(n)
+		length -= n
+	}
+	return true, nil
+}
+
 // Access implements Linux syscall access(2).
 func Access(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
