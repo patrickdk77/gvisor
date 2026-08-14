@@ -158,6 +158,9 @@ func (vfs *VirtualFilesystem) updateResolvingPathForMountPromise(ctx context.Con
 func (vfs *VirtualFilesystem) maybeResolveMountPromise(vd VirtualDentry) {
 	if mp := vfs.getMountPromise(vd); mp != nil {
 		mp.resolved.Store(true)
+		// An unresolved promise prints a placeholder line; a resolved one
+		// prints the mount itself.
+		vfs.invalidateMountInfo()
 		mp.wq.Notify(waiter.EventOut)
 	}
 }

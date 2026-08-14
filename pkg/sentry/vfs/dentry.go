@@ -400,6 +400,9 @@ func (vfs *VirtualFilesystem) CommitRenameReplaceDentry(ctx context.Context, han
 	if handle.flags&renameFlagRenameBegan != 0 {
 		vfs.renameEnd()
 	}
+	// A rename above a mount point changes the pathnames mountinfo reports
+	// for it, with no mount operation involved.
+	vfs.invalidateMountInfo()
 	from.mu.Unlock()
 	if to != nil {
 		to.dead = true
@@ -421,6 +424,9 @@ func (vfs *VirtualFilesystem) CommitRenameExchangeDentry(handle *RenameHandle, f
 	if handle.flags&renameFlagRenameBegan != 0 {
 		vfs.renameEnd()
 	}
+	// A rename above a mount point changes the pathnames mountinfo reports
+	// for it, with no mount operation involved.
+	vfs.invalidateMountInfo()
 	from.mu.Unlock()
 	to.mu.Unlock()
 }

@@ -14,6 +14,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "mount_info_mutex",
+    out = "mount_info_mutex.go",
+    package = "vfs",
+    prefix = "mountInfo",
+)
+
+declare_mutex(
     name = "inotify_event_mutex",
     out = "inotify_event_mutex.go",
     package = "vfs",
@@ -150,6 +157,7 @@ go_library(
         "filesystem_type.go",
         "inotify.go",
         "inotify_event_mutex.go",
+        "mount_info_mutex.go",
         "inotify_mutex.go",
         "lock.go",
         "mount.go",
