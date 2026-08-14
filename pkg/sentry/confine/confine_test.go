@@ -521,10 +521,10 @@ func TestCheckChangeProfile(t *testing.T) {
 				{Pattern: "cage*"},
 				{Pattern: "/usr/bin/cage*"},
 				// A deny rule overrides the allow above it.
-				{Pattern: "jailroot", Deny: true},
+				{Pattern: "cageroot", Deny: true},
 			},
 		},
-		"cageweb":          {Name: "cageweb"},
+		"cageweb":           {Name: "cageweb"},
 		"/usr/bin/cagebash": {Name: "/usr/bin/cagebash"},
 		"unrelated":         {Name: "unrelated"},
 		"anything": {
@@ -552,7 +552,7 @@ func TestCheckChangeProfile(t *testing.T) {
 			// deny wins over the "cage*" allow rule.
 			name:    "a target a deny rule names",
 			from:    "docker-hosted",
-			to:      "jailroot",
+			to:      "cageroot",
 			wantErr: true,
 		},
 		{name: "unconfined may enter any profile", from: "", to: "cageweb"},
@@ -562,7 +562,7 @@ func TestCheckChangeProfile(t *testing.T) {
 			// Would leave the task denied every access.
 			name:    "an undefined target",
 			from:    "docker-hosted",
-			to:      "jailtypo",
+			to:      "cagetypo",
 			wantErr: true,
 		},
 		{
@@ -594,13 +594,13 @@ func TestTransitionOnExec(t *testing.T) {
 			{Pattern: "/**"},
 			{Pattern: "/bin/inherit", Mode: ExecInherit},
 			{Pattern: "/bin/unconfined", Mode: ExecUnconfined},
-			{Pattern: "/bin/named", Mode: ExecProfile, Target: "jail"},
+			{Pattern: "/bin/named", Mode: ExecProfile, Target: "cage"},
 			{Pattern: "/bin/missing", Mode: ExecProfile, Target: "nosuch"},
 			{Pattern: "/bin/bare", Mode: ExecProfile},
 			{Pattern: "/bin/kid", Mode: ExecChild, Target: "kid"},
 			{Pattern: "/bin/nokid", Mode: ExecChild, Target: "nokid"},
 		}},
-		"jail":        {Name: "jail"},
+		"cage":        {Name: "cage"},
 		"outer//kid":  {Name: "outer//kid"},
 		"/bin/bare":   {Name: "/bin/bare"},
 		"/bin/attach": {Name: "/bin/attach"},
@@ -623,7 +623,7 @@ func TestTransitionOnExec(t *testing.T) {
 		{
 			// A path-named profile attaches even though the task is
 			// already confined: before this, a confined task kept
-			// its own profile and the jail was never entered.
+			// its own profile and the cage was never entered.
 			name: "no modifier enters a path-named profile",
 			from: "outer",
 			path: "/bin/attach",
@@ -644,7 +644,7 @@ func TestTransitionOnExec(t *testing.T) {
 			path: "/bin/unconfined",
 			want: "",
 		},
-		{name: "px enters the named profile", from: "outer", path: "/bin/named", want: "jail"},
+		{name: "px enters the named profile", from: "outer", path: "/bin/named", want: "cage"},
 		{name: "px with no target uses the executable's profile", from: "outer", path: "/bin/bare", want: "/bin/bare"},
 		{
 			// Running in the wrong profile is not a safe substitute
@@ -805,15 +805,15 @@ func TestMmapReadOnlyNeedsNoM(t *testing.T) {
 func TestTransitionScrubsEnvironment(t *testing.T) {
 	SetPolicy(map[string]*Profile{
 		"p": {Name: "p", ExecRules: []ExecRule{
-			{Pattern: "/bin/px", Mode: ExecProfile, Target: "jail"},
-			{Pattern: "/bin/Px", Mode: ExecProfile, Target: "jail", Scrub: true},
+			{Pattern: "/bin/px", Mode: ExecProfile, Target: "cage"},
+			{Pattern: "/bin/Px", Mode: ExecProfile, Target: "cage", Scrub: true},
 			{Pattern: "/bin/cx", Mode: ExecChild, Target: "kid"},
 			{Pattern: "/bin/Cx", Mode: ExecChild, Target: "kid", Scrub: true},
 			{Pattern: "/bin/ux", Mode: ExecUnconfined},
 			{Pattern: "/bin/Ux", Mode: ExecUnconfined, Scrub: true},
 			{Pattern: "/bin/ix", Mode: ExecInherit},
 		}},
-		"jail":   {Name: "jail"},
+		"cage":   {Name: "cage"},
 		"p//kid": {Name: "p//kid"},
 	})
 	defer SetPolicy(nil)
@@ -1000,10 +1000,10 @@ func TestChangeProfileExecCondition(t *testing.T) {
 	SetPolicy(map[string]*Profile{
 		"outer": {Name: "outer", ChangeProfile: []ChangeRule{
 			{Pattern: "cage*"},
-			{Pattern: "jailroot", Deny: true, Exec: "/usr/bin/suexec"},
+			{Pattern: "cageroot", Deny: true, Exec: "/usr/bin/suexec"},
 		}},
-		"cageweb": {Name: "cageweb"},
-		"jailroot": {Name: "jailroot"},
+		"cageweb":  {Name: "cageweb"},
+		"cageroot": {Name: "cageroot"},
 	})
 	defer SetPolicy(nil)
 
@@ -1017,7 +1017,7 @@ func TestChangeProfileExecCondition(t *testing.T) {
 		{
 			// The deny rule names this exec, so it applies.
 			name:    "a denied target with the named exec",
-			to:      "jailroot",
+			to:      "cageroot",
 			exec:    "/usr/bin/suexec",
 			wantErr: true,
 		},
@@ -1025,13 +1025,13 @@ func TestChangeProfileExecCondition(t *testing.T) {
 			// A different exec does not match the condition, so the
 			// deny rule does not apply and the wildcard allows it.
 			name: "a denied target with a different exec",
-			to:   "jailroot",
+			to:   "cageroot",
 			exec: "/usr/bin/other",
 		},
 		{
 			// An immediate change accompanies no exec.
 			name: "an immediate change",
-			to:   "jailroot",
+			to:   "cageroot",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

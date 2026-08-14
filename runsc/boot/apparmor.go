@@ -634,7 +634,7 @@ func parseAppArmorProfiles(pfs policyFS, r io.Reader, name string, policy *AppAr
 			// A profile attaches on exec of the path it names. That is
 			// the profile's own name when the name is a path
 			// ("profile /bin/cagebash {"), or the attachment
-			// specification that follows the name ("profile jail
+			// specification that follows the name ("profile cage
 			// /bin/cagebash {").
 			attach := ""
 			if strings.HasPrefix(profile, "/") {
