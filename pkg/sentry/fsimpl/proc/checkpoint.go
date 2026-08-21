@@ -34,13 +34,17 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func (fs *filesystem) newGvisorInode(ctx context.Context, root *auth.Credentials, internalData *InternalData, k *kernel.Kernel) kernfs.Inode {
+func (fs *filesystem) newGvisorInode(ctx context.Context, root *auth.Credentials, internalData *InternalData, k *kernel.Kernel) (kernfs.Inode, error) {
 	gvisorFiles := make(map[string]kernfs.Inode)
 	if internalData.GVisorMarkerFile {
 		gvisorFiles["kernel_is_gvisor"] = fs.newInode(ctx, root, 0444, newStaticFile("gvisor\n"))
 	}
 	log.Infof("Setting up checkpoint files under [procfs]/gvisor")
-	gvisorFiles["checkpoint"] = newCheckpointInode(ctx, k, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), internalData.SaveTriggerEnabled)
+	checkpoint, err := newCheckpointInode(ctx, k, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), internalData.SaveTriggerEnabled)
+	if err != nil {
+		return nil, err
+	}
+	gvisorFiles["checkpoint"] = checkpoint
 	if internalData.SaveTriggerEnabled {
 		// The container's spec environment holds whatever the pod spec
 		// put there, secrets included, so it is only exposed to the
@@ -52,32 +56,25 @@ func (fs *filesystem) newGvisorInode(ctx context.Context, root *auth.Credentials
 	}
 	if internalData.FSCheckpointEnabled {
 		log.Infof("Setting up fscheckpoint files under [procfs]/gvisor")
-		gvisorFiles["fscheckpoint"] = newFSCheckpointInode(ctx, k, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno())
+		fsCheckpoint, err := newFSCheckpointInode(ctx, k, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno())
+		if err != nil {
+			return nil, err
+		}
+		gvisorFiles["fscheckpoint"] = fsCheckpoint
 	}
 	if len(gvisorFiles) == 0 {
-		return nil
+		return nil, nil
 	}
-	return fs.newStaticDir(ctx, root, gvisorFiles)
+	return fs.newStaticDir(ctx, root, gvisorFiles), nil
 }
 
 // checkpointInode represents the inode for /proc/gvisor/checkpoint.
 //
 // +stateify savable
 type checkpointInode struct {
-	// This uses fdInfoDirInodeRefs despite not being fdInfoDirInode. This is
-	// because to prevent a hypothetical checkpointInodeRefs from leaking to
-	// OSS, we would need Copybara to delete the relevant
-	// go_template_instance() BUILD target, and while this is possible it seems
-	// to require replicating the whole target in Copybara config to make the
-	// deletion reversible. This only affects the reference leak warning that
-	// is printed when reference leak detection is enabled. We pick
-	// fdInfoDirInodeRefs since it's furthest from procfs root, and therefore
-	// least likely to be affected by actual reference leaks (since children
-	// may propagate reference leaks to their parents).
 	kernfs.InodeAttrs
 	kernfs.InodeNoStatFS
-	fdInfoDirInodeRefs
-	kernfs.InodeTemporary
+	kernfs.InodeNoopRefCount
 	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
@@ -92,10 +89,10 @@ type checkpointInode struct {
 
 var _ kernfs.Inode = (*checkpointInode)(nil)
 
-func newCheckpointInode(ctx context.Context, k *kernel.Kernel, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, saveTriggerEnabled bool) *checkpointInode {
-	rdevMajor, err := k.VFS().GetDynamicCharDevMajor()
+func newCheckpointInode(ctx context.Context, k *kernel.Kernel, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, saveTriggerEnabled bool) (*checkpointInode, error) {
+	rdevMajor, err := k.VFS().GetSharedDynamicCharDevMajor(vfs.CheckpointDeviceMajorKey)
 	if err != nil {
-		panic(fmt.Sprintf("failed to allocate device number for /proc/gvisor/checkpoint: %v", err))
+		return nil, fmt.Errorf("failed to allocate device number for /proc/gvisor/checkpoint: %w", err)
 	}
 	perm := linux.FileMode(0444)
 	if saveTriggerEnabled {
@@ -106,18 +103,10 @@ func newCheckpointInode(ctx context.Context, k *kernel.Kernel, creds *auth.Crede
 		rdevMajor:          rdevMajor,
 		saveTriggerEnabled: saveTriggerEnabled,
 	}
-	f.fdInfoDirInodeRefs.InitRefs()
 	// Appear to be a character device so that applications don't carelessly
 	// try to read from us.
 	f.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeCharacterDevice|perm)
-	return f
-}
-
-// DecRef implements kernfs.Inode.DecRef.
-func (f *checkpointInode) DecRef(ctx context.Context) {
-	f.fdInfoDirInodeRefs.DecRef(func() {
-		f.k.VFS().PutDynamicCharDevMajor(f.rdevMajor)
-	})
+	return f, nil
 }
 
 // Stat implements kernfs.Inode.Stat.
@@ -385,11 +374,9 @@ func (r *specEnvironData) Generate(ctx context.Context, buf *bytes.Buffer) error
 //
 // +stateify savable
 type fsCheckpointInode struct {
-	// This uses fdInfoDirInodeRefs for the same reason as checkpointInode.
 	kernfs.InodeAttrs
 	kernfs.InodeNoStatFS
-	fdInfoDirInodeRefs
-	kernfs.InodeTemporary
+	kernfs.InodeNoopRefCount
 	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
@@ -401,27 +388,19 @@ type fsCheckpointInode struct {
 	rdevMajor uint32
 }
 
-func newFSCheckpointInode(ctx context.Context, k *kernel.Kernel, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64) *fsCheckpointInode {
-	rdevMajor, err := k.VFS().GetDynamicCharDevMajor()
+func newFSCheckpointInode(ctx context.Context, k *kernel.Kernel, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64) (*fsCheckpointInode, error) {
+	rdevMajor, err := k.VFS().GetSharedDynamicCharDevMajor(vfs.FSCheckpointDeviceMajorKey)
 	if err != nil {
-		panic(fmt.Sprintf("failed to allocate device number for /proc/gvisor/fscheckpoint: %v", err))
+		return nil, fmt.Errorf("failed to allocate device number for /proc/gvisor/fscheckpoint: %w", err)
 	}
 	i := &fsCheckpointInode{
 		k:         k,
 		rdevMajor: rdevMajor,
 	}
-	i.fdInfoDirInodeRefs.InitRefs()
 	// Appear to be a character device so that applications don't carelessly
 	// try to read from us.
 	i.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeCharacterDevice|0o666)
-	return i
-}
-
-// DecRef implements kernfs.Inode.DecRef.
-func (i *fsCheckpointInode) DecRef(ctx context.Context) {
-	i.fdInfoDirInodeRefs.DecRef(func() {
-		i.k.VFS().PutDynamicCharDevMajor(i.rdevMajor)
-	})
+	return i, nil
 }
 
 // Stat implements kernfs.Inode.Stat.

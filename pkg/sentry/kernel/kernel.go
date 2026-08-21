@@ -1193,6 +1193,11 @@ type CreateProcessArgs struct {
 
 	// TTY is the optional controlling TTY to associate with this process.
 	TTY *TTY
+
+	// StartupTimeline tracks the creation of this process as part of overall
+	// sandbox startup. CreateProcess records midpoints on it, but ownership
+	// remains with its caller.
+	StartupTimeline *timing.Timeline
 }
 
 // NewContext returns a context.Context that represents the task that will be
@@ -1348,6 +1353,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	}
 	fsContext := NewFSContext(root, wd, args.Umask)
 	refcountCu.Add(func() { fsContext.DecRef(ctx) })
+	args.StartupTimeline.Reached("FS context created")
 
 	tg := k.NewThreadGroup(args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
 	cu := cleanup.Make(func() {
@@ -1391,12 +1397,14 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		NoNewPrivs:          args.NoNewPrivs,
 		StopPrivGain:        false,
 		AllowSUID:           k.AllowSUID,
+		StartupTimeline:     args.StartupTimeline,
 	}
 
 	image, newCreds, _, se := k.LoadTaskImage(ctx, loadArgs)
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}
+	args.StartupTimeline.Reached("task image loaded")
 	args.FDTable.IncRef()
 
 	cgroupns := args.CgroupNamespace
@@ -1438,6 +1446,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if err != nil {
 		return nil, 0, err
 	}
+	args.StartupTimeline.Reached("init task created")
 	t.traceExecEvent(image) // Simulate exec for tracing.
 
 	// Set TTY if configured.
@@ -1924,6 +1933,15 @@ func (k *Kernel) RealtimeClock() ktime.SampledClock {
 
 // MonotonicClock returns the application CLOCK_MONOTONIC clock.
 func (k *Kernel) MonotonicClock() ktime.SampledClock {
+	return k.timekeeper.monotonicClock
+}
+
+// MonotonicRawClock returns the system CLOCK_MONOTONIC_RAW clock. When it is
+// not enabled as a distinct clock this is the same as MonotonicClock.
+func (k *Kernel) MonotonicRawClock() ktime.SampledClock {
+	if k.timekeeper.monotonicRawClock != nil {
+		return k.timekeeper.monotonicRawClock
+	}
 	return k.timekeeper.monotonicClock
 }
 

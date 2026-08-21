@@ -68,6 +68,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -304,6 +305,7 @@ func setupContainerVFS(ctx context.Context, info *containerInfo, mntr *container
 	if err := createDeviceFiles(rootCtx, rootCreds, info, mntr.l.k.VFS(), mnsRoot); err != nil {
 		return fmt.Errorf("failed to create device files: %w", err)
 	}
+	procArgs.StartupTimeline.Reached("device files created")
 
 	if err := mntr.l.k.VFS().MkdirAllAt(
 		ctx, procArgs.WorkingDirectory, mnsRoot, rootCreds,
@@ -323,6 +325,7 @@ func setupContainerVFS(ctx context.Context, info *containerInfo, mntr *container
 		return err
 	}
 	procArgs.Filename = resolved
+	procArgs.StartupTimeline.Reached("executable path resolved")
 	return nil
 }
 
@@ -457,6 +460,9 @@ func goferMountData(fd int, fa config.FileAccessType, conf *config.Config, suppr
 	}
 	if !conf.HostFifo.AllowOpen() {
 		opts = append(opts, "disable_fifo_open")
+	}
+	if conf.CharacterDevicePolicy.AllowsPassthrough() {
+		opts = append(opts, "char_device_policy="+conf.CharacterDevicePolicy.String())
 	}
 	return opts
 }
@@ -597,6 +603,7 @@ func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Cre
 	if err != nil {
 		return nil, fmt.Errorf("creating mount namespace: %w", err)
 	}
+	rootProcArgs.StartupTimeline.Reached("rootfs mounted")
 	rootProcArgs.MountNamespace = mns
 
 	root := mns.Root(rootCtx)
@@ -615,9 +622,10 @@ func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Cre
 	}
 
 	// Mount submounts.
-	if err := c.mountSubmounts(rootCtx, spec, conf, mns, rootCreds); err != nil {
+	if err := c.mountSubmounts(rootCtx, spec, conf, mns, rootCreds, rootProcArgs.StartupTimeline); err != nil {
 		return nil, fmt.Errorf("mounting submounts: %w", err)
 	}
+	rootProcArgs.StartupTimeline.Reached("submounts mounted")
 
 	return mns, nil
 }
@@ -898,11 +906,12 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	return &overlayOpts, cu.Release(), nil
 }
 
-func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials) error {
+func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, timeline *timing.Timeline) error {
 	mounts, err := c.prepareMounts()
 	if err != nil {
 		return err
 	}
+	timeline.Reached("submounts prepared")
 
 	for i := range mounts {
 		submount := &mounts[i]
@@ -960,6 +969,9 @@ func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec,
 					panic(fmt.Sprintf("failed to restore mount at %q back to readonly: %v", submount.mount.Destination, err))
 				}
 			}()
+		}
+		if timeline != nil {
+			timeline.Reached(fmt.Sprintf("mounted %q", submount.mount.Destination))
 		}
 	}
 

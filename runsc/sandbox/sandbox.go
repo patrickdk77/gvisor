@@ -297,6 +297,10 @@ type Args struct {
 	// Gcgroup is the cgroup that the sandbox is part of.
 	Cgroup cgroup.Cgroup
 
+	// CloneIntoCgroupFD, when non-nil, is an FD to `Cgroup`'s directory. The
+	// sandbox process is created inside the cgroup via `CLONE_INTO_CGROUP`.
+	CloneIntoCgroupFD *os.File
+
 	// Attached indicates that the sandbox lifecycle is attached with the caller.
 	// If the caller exits, the sandbox should exit too.
 	Attached bool
@@ -963,10 +967,23 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		// when re-parented.
 		Setsid: true,
 	}
+	if args.CloneIntoCgroupFD != nil {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = int(args.CloneIntoCgroupFD.Fd())
+	}
 
-	// Set Args[0] to make easier to spot the sandbox process. Otherwise it's
-	// shown as `exe`.
+	// Set Args[0] to make easier to spot the sandbox process.
 	cmd.Args[0] = "runsc-sandbox"
+
+	// If the prewarmer sidecar is available, exec it ahead of the boot binary.
+	// Its argv is `gvisor-prewarmer <binary> <argv[0]> [argv[1:]...]`.
+	if p, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
+		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
+		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
+		cmd.Path = p
+	} else {
+		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly.", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+	}
 
 	// Transfer FDs that need to be present before the "boot" command.
 	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
@@ -1914,7 +1931,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 	}
 	defer unix.Close(socketFDs[1])
 	clientSockFile := os.NewFile(uintptr(socketFDs[0]), "checkpointgofer-socket")
-	err = cgroup.RunInCgroup(cg, func() error {
+	err = cgroup.RunInCgroup(cg, func(cloneIntoCgroupFD *os.File) error {
 		argv := append([]string{"runsc-checkpointgofer"}, conf.ToFlags()...)
 		extraFiles := []uintptr{devNullFile.Fd(), devNullFile.Fd(), devNullFile.Fd(), uintptr(socketFDs[1]), gcsOptsFile.Fd()}
 
@@ -1950,15 +1967,20 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
 		// v1.service.newCommand()).
 		env := slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") })
+		sysProcAttr := &unix.SysProcAttr{
+			// Detach from this session, otherwise the subprocess will get
+			// SIGHUP and SIGCONT when re-parented.
+			Setsid: true,
+		}
+		if cloneIntoCgroupFD != nil {
+			sysProcAttr.UseCgroupFD = true
+			sysProcAttr.CgroupFD = int(cloneIntoCgroupFD.Fd())
+		}
 		_, err := gvisorbinaries.CheckpointGofer.ForkExec(gvisorbinaries.Options{
-			Argv:  argv,
-			Envv:  env,
-			Files: extraFiles,
-			SysProcAttr: &unix.SysProcAttr{
-				// Detach from this session, otherwise the subprocess will get
-				// SIGHUP and SIGCONT when re-parented.
-				Setsid: true,
-			},
+			Argv:        argv,
+			Envv:        env,
+			Files:       extraFiles,
+			SysProcAttr: sysProcAttr,
 		})
 		return err
 	})

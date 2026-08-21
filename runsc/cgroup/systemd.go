@@ -212,6 +212,13 @@ func (c *cgroupSystemd) MakePath(string) string {
 	return path
 }
 
+// CloneIntoCgroup implements Cgroup.CloneIntoCgroup.
+func (c *cgroupSystemd) CloneIntoCgroup() (*os.File, error) {
+	// Can't use CLONE_INTO_CGROUP here because systemd is the thing doing the
+	// process migration, not us.
+	return nil, fmt.Errorf("CLONE_INTO_CGROUP cannot be used with systemd cgroup %q", c.unitName())
+}
+
 // Join implements Cgroup.Join.
 func (c *cgroupSystemd) Join() (func(), error) {
 	log.Debugf("Joining systemd cgroup %v", c.unitName())

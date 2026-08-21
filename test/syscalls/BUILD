@@ -1392,5 +1392,7 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    # TODO(b/546149934): These tests timeout with s/r, fix them and then enable.
+    save = False,
     test = "//test/syscalls/linux:posix_acl_test",
 )
