@@ -296,6 +296,11 @@ func New(opts platform.Options) (*Systrap, error) {
 		archState.Init()
 		// GOMAXPROCS has been set at this point.
 		maxSysmsgThreads = runtime.GOMAXPROCS(0)
+		// Only allow lowering the default: raising it would let a
+		// single subprocess oversubscribe the sandbox.
+		if opts.MaxSysmsgThreads > 0 && opts.MaxSysmsgThreads < maxSysmsgThreads {
+			maxSysmsgThreads = opts.MaxSysmsgThreads
+		}
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
 	}

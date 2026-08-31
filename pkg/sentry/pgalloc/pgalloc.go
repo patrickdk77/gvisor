@@ -118,6 +118,20 @@ type MemoryFile struct {
 	// haveWaste is protected by mu.
 	haveWaste bool
 
+	// wasteBytes is the total size of waste pages, i.e. of gaps in
+	// unwasteSmall/Huge. When opts.WasteRetainBytes is non-zero, it
+	// gates the releaser so that up to WasteRetainBytes of waste stays
+	// committed and recyclable.
+	//
+	// wasteBytes is protected by mu.
+	wasteBytes uint64
+
+	// releaseAllWaste is true when waste retention is suspended so
+	// that all waste pages drain, e.g. before SaveTo.
+	//
+	// releaseAllWaste is protected by mu.
+	releaseAllWaste bool
+
 	// releaseCond is signaled (with mu locked) when haveWaste or destroyed
 	// transitions from false to true.
 	releaseCond sync.Cond
@@ -348,6 +362,14 @@ type MemoryFileOpts struct {
 	// DelayedEviction controls the extent to which the MemoryFile may delay
 	// eviction of evictable allocations.
 	DelayedEviction DelayedEvictionType
+
+	// WasteRetainBytes is the maximum size of waste pages to retain
+	// for recycling rather than releasing to the host. Retained waste
+	// stays committed; recycling zeroes the pages in place, avoiding
+	// the decommit/recommit cycle for workloads that repeatedly free
+	// and reallocate memory. 0 disables retention (release
+	// immediately, the historical behavior).
+	WasteRetainBytes uint64
 
 	// If UseHostMemcgPressure is true, use host memory cgroup pressure level
 	// notifications to determine when eviction is necessary. This option has
@@ -723,7 +745,10 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 				f.DecRef(fr)
 				return memmap.FileRange{}, err
 			}
-			if canPopulate() {
+			// Recycled pages are already committed, and
+			// manuallyZero below writes every byte, so
+			// pre-population would be redundant.
+			if !alloc.recycled && canPopulate() {
 				rem := dsts
 				for tryPopulate(rem.Head()) {
 					rem = rem.Tail()
@@ -807,6 +832,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 				}
 			}
 			unwaste.Insert(uwgap, fr, unwasteInfo{})
+			f.wasteBytes -= fr.Length()
 			// Update reference count for these pages from 0 to 1.
 			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
 				uf := ufseg.ValuePtr()
@@ -1267,6 +1293,7 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 				// Mark these pages as waste.
 				wasteFR := ufseg.Range()
 				unwaste.RemoveFullRange(wasteFR)
+				f.wasteBytes += wasteFR.Length()
 				haveWaste = true
 				// Reclassify waste memory as System until it's recycled or
 				// released.
@@ -1291,10 +1318,24 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 
 	// Wake the releaser if we marked any pages as waste. Leave this until just
 	// before unlocking f.mu.
-	if haveWaste && !f.haveWaste {
+	if haveWaste && (!f.haveWaste || (f.opts.WasteRetainBytes != 0 && f.releasableWasteLocked() > 0)) {
 		f.haveWaste = true
 		f.releaseCond.Signal()
 	}
+}
+
+// releasableWasteLocked returns the size of waste that the releaser
+// should release, respecting waste retention.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) releasableWasteLocked() uint64 {
+	if f.releaseAllWaste || f.opts.WasteRetainBytes == 0 {
+		return f.wasteBytes
+	}
+	if f.wasteBytes <= f.opts.WasteRetainBytes {
+		return 0
+	}
+	return f.wasteBytes - f.opts.WasteRetainBytes
 }
 
 // releaserMain implements the releaser goroutine.
@@ -1313,7 +1354,7 @@ MainLoop:
 				}
 				return
 			}
-			if f.haveWaste {
+			if f.haveWaste && (f.wasteBytes == 0 || f.releasableWasteLocked() > 0) {
 				break
 			}
 			if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
@@ -1339,7 +1380,13 @@ MainLoop:
 				if fr.Length() > maxReleasingBytes {
 					fr.Start = fr.End - maxReleasingBytes
 				}
+				// Respect waste retention: only release the
+				// excess above the retention watermark.
+				if releasable := f.releasableWasteLocked(); fr.Length() > releasable {
+					fr.Start = fr.End - releasable
+				}
 				unwaste.Insert(uwgap, fr, unwasteInfo{})
+				f.wasteBytes -= fr.Length()
 				f.releaseLocked(fr, i == 1)
 				continue MainLoop
 			}

@@ -190,14 +190,19 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
 
-	// Wait for memory release.
+	// Wait for memory release. Suspend waste retention so that all
+	// waste pages drain; retained waste would otherwise keep
+	// haveWaste true forever.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.releaseAllWaste = true
+	f.releaseCond.Signal()
 	for f.haveWaste {
 		f.mu.Unlock()
 		runtime.Gosched()
 		f.mu.Lock()
 	}
+	f.releaseAllWaste = false
 
 	// Ensure that there are no pending evictions.
 	if len(f.evictable) != 0 {

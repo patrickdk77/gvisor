@@ -59,6 +59,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
@@ -747,6 +748,10 @@ func New(args Args) (*Loader, error) {
 	gomaxprocs.SetBase(args.NumCPU)
 	args.StartupTimer.Reached("GOMAXPROCS set")
 
+	if args.Conf.MMEagerPopulateMB > 0 {
+		mm.SetEagerPopulateMaxBytes(uint64(args.Conf.MMEagerPopulateMB) << 20)
+	}
+
 	// Start filesystem checkpoint restore as soon as possible to maximize
 	// parallel loading.
 	if len(args.FSRestoreFDs) != 0 {
@@ -852,7 +857,7 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create memory file.
-	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP, args.Conf.PgallocWasteRetainMB)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1223,6 +1228,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 		DeviceFile:             deviceFile,
 		DisableSyscallPatching: platformName == "systrap" && conf.SystrapDisableSyscallPatching,
 		DisableFastPath:        platformName == "systrap" && conf.SystrapDisableFastPath,
+		MaxSysmsgThreads:       conf.SystrapMaxSysmsgThreads,
 		ApplicationCores:       numCPU,
 		UseCPUNums:             platformName == "kvm" && conf.UseCPUNums,
 		SandboxID:              sandboxID,
@@ -1231,7 +1237,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 	})
 }
 
-func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+func createMemoryFile(appHugePages bool, hostTHP HostTHP, wasteRetainMB int) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
@@ -1243,6 +1249,9 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
+	}
+	if wasteRetainMB > 0 {
+		mfopts.WasteRetainBytes = uint64(wasteRetainMB) << 20
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

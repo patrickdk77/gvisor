@@ -132,6 +132,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
+	flagSet.Int("pgalloc-waste-retain-mb", 0, "maximum size, in MiB, of freed application memory to retain committed for recycling instead of releasing to the host. Speeds up workloads that repeatedly free and reallocate memory, at the cost of up to this much extra held memory. 0 disables retention.")
+	flagSet.Int("mm-eager-populate-mb", 0, "maximum size, in MiB, of an anonymous mapping to populate eagerly at mmap time instead of on first fault. Reduces page-fault round-trips for workloads that mmap and immediately write regions larger than the 2 MiB default. 0 keeps the default.")
+	flagSet.Int("systrap-max-sysmsg-threads", 0, "caps the number of stub threads per Systrap subprocess below the default of GOMAXPROCS. Workloads with many processes oversubscribe the CPUs with the default; a lower cap reduces scheduler contention. 0 keeps the default.")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")

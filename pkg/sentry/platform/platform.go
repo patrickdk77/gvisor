@@ -599,6 +599,12 @@ type Options struct {
 	// DisableFastPath, if true, completely disables the Systrap fast path.
 	DisableFastPath bool
 
+	// MaxSysmsgThreads, if positive, caps the number of sysmsg
+	// (stub) threads per Systrap subprocess below the default of
+	// GOMAXPROCS. Many-process workloads oversubscribe the CPUs
+	// with the default; a lower cap reduces scheduler contention.
+	MaxSysmsgThreads int
+
 	// ApplicationCores is used by KVM to determine the correct amount of
 	// vCPUs to create.
 	ApplicationCores int

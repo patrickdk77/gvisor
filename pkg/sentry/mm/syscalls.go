@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -72,6 +73,26 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
 	mm.activeMu.RUnlock()
 	return err
+}
+
+// eagerPopulateMaxBytes overrides the maximum length of an anonymous
+// mapping that MMap populates eagerly (see the anonymous-mapping case
+// in MMap). 0 means the default, hostarch.HugePageSize. It is
+// package-level because MemoryManagers have no access to
+// configuration; it must be set before any tasks run.
+var eagerPopulateMaxBytes atomicbitops.Uint64
+
+// SetEagerPopulateMaxBytes sets the maximum length of an anonymous
+// mapping that MMap populates eagerly. Call before any tasks run.
+func SetEagerPopulateMaxBytes(b uint64) {
+	eagerPopulateMaxBytes.Store(b)
+}
+
+func eagerPopulateMax() uint64 {
+	if b := eagerPopulateMaxBytes.Load(); b != 0 {
+		return b
+	}
+	return hostarch.HugePageSize
 }
 
 // MMap establishes a memory mapping.
@@ -161,7 +182,7 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 		// Get pmas and map as requested.
 		mm.populateVMAAndUnlock(ctx, vseg, ar, opts.PlatformEffect)
 
-	case opts.Mappable == nil && length <= hostarch.HugePageSize:
+	case opts.Mappable == nil && uint64(length) <= eagerPopulateMax():
 		// NOTE(b/63077076, b/63360184): Get pmas and map eagerly in the hope
 		// that doing so will save on future page faults. We only do this for
 		// anonymous mappings, since otherwise the cost of

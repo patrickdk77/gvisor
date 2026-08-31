@@ -502,6 +502,19 @@ type Config struct {
 	// SystrapDisableFastPath disables the Systrap fast path entirely.
 	SystrapDisableFastPath bool `flag:"systrap-disable-fast-path"`
 
+	// PgallocWasteRetainMB is the maximum size, in MiB, of freed
+	// application memory retained committed for recycling.
+	PgallocWasteRetainMB int `flag:"pgalloc-waste-retain-mb"`
+
+	// MMEagerPopulateMB is the maximum size, in MiB, of an anonymous
+	// mapping that is populated eagerly at mmap time. 0 keeps the
+	// default (2 MiB).
+	MMEagerPopulateMB int `flag:"mm-eager-populate-mb"`
+
+	// SystrapMaxSysmsgThreads caps the number of stub threads per
+	// Systrap subprocess below the default of GOMAXPROCS.
+	SystrapMaxSysmsgThreads int `flag:"systrap-max-sysmsg-threads"`
+
 	// Nftables enables support for nftables to be used instead of iptables.
 	Nftables bool `flag:"TESTONLY-nftables"`
 
