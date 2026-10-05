@@ -2804,6 +2804,82 @@ func TestSmallSegReceiveWindowAdvertisement(t *testing.T) {
 	}
 }
 
+// sendSmallSegment sends a segment with n bytes of payload at seq and returns
+// the ACK number and the window of the ACK for it.
+func sendSmallSegment(t *testing.T, c *context.Context, seq seqnum.Value, n seqnum.Size) (seqnum.Value, seqnum.Size) {
+	t.Helper()
+	c.SendPacket(make([]byte, n), &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: c.Port,
+		Flags:   header.TCPFlagAck,
+		SeqNum:  seq,
+		AckNum:  c.IRS.Add(1),
+		RcvWnd:  30000,
+	})
+	b := c.GetPacketWithTimeout(time.Second)
+	if b == nil {
+		t.Fatalf("no ACK for the segment at %d; SegmentQueueDropped = %d", seq, c.EP.Stats().(*tcp.Stats).ReceiveErrors.SegmentQueueDropped.Value())
+	}
+	defer b.Release()
+	h := header.TCP(header.IPv4(b.AsSlice()).Payload())
+	return seqnum.Value(h.AckNumber()), seqnum.Size(h.WindowSize()) << c.RcvdWindowScale
+}
+
+// TestSmallSegmentsBufferFullAcked tests that a segment within the window is
+// acknowledged when it is refused because the receive buffer is full (RFC 9293
+// section 3.10.7.4). The initial window is half the buffer, which segments
+// smaller than the segment overhead fill up before the window closes.
+func TestSmallSegmentsBufferFullAcked(t *testing.T) {
+	c := context.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+	c.CreateConnected(context.TestInitialSequenceNumber, 30000, 32<<10)
+
+	const mss = 536
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	for edge := seq.Add(mss); seq.Add(mss).LessThanEq(edge); seq = seq.Add(mss) {
+		if ack, wnd := sendSmallSegment(t, c, seq, mss); edge.LessThan(ack.Add(wnd)) {
+			edge = ack.Add(wnd)
+		}
+	}
+}
+
+// TestSmallSegmentsWindowClosesBeforeBufferFull tests that the window
+// advertised for segments smaller than the segment overhead closes before
+// the receive buffer is full, so that no segment within it is refused.
+func TestSmallSegmentsWindowClosesBeforeBufferFull(t *testing.T) {
+	c := context.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+	c.CreateConnectedWithRawOptions(context.TestInitialSequenceNumber, 30000, 128<<10, []byte{
+		header.TCPOptionWS, 3, 0, header.TCPOptionNOP,
+	})
+
+	// Read the first segment, so that the ACK for the next one moves the
+	// right edge of the initial window to what the buffer holds.
+	const mss = 536
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	sendSmallSegment(t, c, seq, mss)
+	seq = seq.Add(mss)
+	if _, err := c.EP.Read(io.Discard, tcpip.ReadOptions{}); err != nil {
+		t.Fatalf("c.EP.Read: %s", err)
+	}
+
+	var wnd seqnum.Size
+	for edge := seq.Add(mss); seq != edge; {
+		n := min(mss, seq.Size(edge))
+		var ack seqnum.Value
+		ack, wnd = sendSmallSegment(t, c, seq, n)
+		if seq = seq.Add(n); ack != seq {
+			t.Fatalf("got ACK %d for the segment ending at %d within the window ending at %d", ack, seq, edge)
+		}
+		if edge.LessThan(ack.Add(wnd)) {
+			edge = ack.Add(wnd)
+		}
+	}
+	if wnd != 0 {
+		t.Fatalf("got window %d, want 0", wnd)
+	}
+}
+
 func TestNoWindowShrinking(t *testing.T) {
 	c := context.New(t, e2e.DefaultMTU)
 	defer c.Cleanup()
@@ -7317,8 +7393,13 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 
 	// Verify that we receive a non-zero window update ACK. When running
 	// under thread sanitizer this test can end up sending more than 1
-	// ack, 1 for the non-zero window
+	// ack, 1 for the non-zero window. Segments refused for lack of buffer
+	// space are acknowledged with a zero window before it.
 	p := c.GetPacket()
+	for header.TCP(header.IPv4(p.AsSlice()).Payload()).WindowSize() == 0 {
+		p.Release()
+		p = c.GetPacket()
+	}
 	defer p.Release()
 	checker.IPv4(t, p, checker.TCP(
 		checker.TCPAckNum(wantAckNum),

@@ -59,6 +59,17 @@ func (q *segmentQueue) enqueue(s *segment) bool {
 	// is currently full).
 	allow := (used <= int(bufSz) || s.payloadSize() == 0) && !q.frozen
 
+	if !allow && !q.frozen {
+		// The receive buffer is full. Drop the payload but queue the
+		// segment so that it is acknowledged (RFC 9293 section 3.10.7.4),
+		// as Linux does when tcp_data_queue drops for memory. A zero
+		// sized segment is admitted regardless of memory.
+		s.pkt.Data().CapLength(0)
+		s.dataMemSize = s.pkt.MemSize()
+		s.dataDropped = true
+		allow = true
+	}
+
 	if allow {
 		s.IncRef()
 		q.list.PushBack(s)

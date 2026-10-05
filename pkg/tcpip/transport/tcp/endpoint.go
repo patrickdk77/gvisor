@@ -398,6 +398,16 @@ type Endpoint struct {
 	// the buffer not including any segment overheads.
 	rcvMemUsed atomicbitops.Int32
 
+	// rcvSegPayload and rcvSegMem are the payload size and segMemSize of the
+	// largest segment delivered to rcvQueue so far. selectWindowLocked uses
+	// their ratio to advertise no more window than the free receive buffer
+	// can hold. Zero until the first segment with payload arrives.
+	//
+	// +checklocks:rcvQueueMu
+	rcvSegPayload int `state:"nosave"`
+	// +checklocks:rcvQueueMu
+	rcvSegMem int `state:"nosave"`
+
 	// mu protects all endpoint fields unless documented otherwise. mu must
 	// be acquired before interacting with the endpoint fields.
 	//
@@ -1278,6 +1288,26 @@ func wndFromSpace(space int) int {
 	return space >> rcvAdvWndScale
 }
 
+// wndFromAvailableLocked returns the window to advertise for space bytes of
+// free receive buffer. wndFromSpace assumes that a segment's overhead is at
+// most its payload; for smaller segments the window is further limited to
+// the payload of the segments segmentQueue.enqueue admits into space at the
+// observed per-segment cost, so that the buffer does not fill up before the
+// window closes.
+//
+// +checklocks:e.rcvQueueMu
+func (e *Endpoint) wndFromAvailableLocked(space int) int {
+	wnd := wndFromSpace(space)
+	if e.rcvSegMem > 0 && space > 0 {
+		// enqueue admits a segment while the memory used does not exceed
+		// the buffer size.
+		if segs := space/e.rcvSegMem + 1; segs*e.rcvSegPayload < wnd {
+			wnd = segs * e.rcvSegPayload
+		}
+	}
+	return wnd
+}
+
 // initialReceiveWindow returns the initial receive window to advertise in the
 // SYN/SYN-ACK.
 func (e *Endpoint) initialReceiveWindow() int {
@@ -1716,7 +1746,7 @@ func (e *Endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 // +checklocks:e.mu
 // +checklocks:e.rcvQueueMu
 func (e *Endpoint) selectWindowLocked(rcvBufSize int) (wnd seqnum.Size) {
-	wndFromAvailable := wndFromSpace(e.receiveBufferAvailableLocked(rcvBufSize))
+	wndFromAvailable := e.wndFromAvailableLocked(e.receiveBufferAvailableLocked(rcvBufSize))
 	maxWindow := wndFromSpace(rcvBufSize)
 	wndFromUsedBytes := maxWindow - e.RcvBufUsed
 
@@ -3007,6 +3037,11 @@ func (e *Endpoint) enqueueSegment(s *segment) bool {
 		e.stats.ReceiveErrors.SegmentQueueDropped.Increment()
 		return false
 	}
+	if s.dataDropped {
+		// The payload was dropped; the segment is only acknowledged.
+		e.stack.Stats().DroppedPackets.Increment()
+		e.stats.ReceiveErrors.SegmentQueueDropped.Increment()
+	}
 	return true
 }
 
@@ -3142,7 +3177,13 @@ func (e *Endpoint) updateSndBufferUsage(v int) {
 func (e *Endpoint) readyToRead(s *segment) {
 	e.rcvQueueMu.Lock()
 	if s != nil {
-		e.RcvBufUsed += s.payloadSize()
+		n := s.payloadSize()
+		e.RcvBufUsed += n
+		// Measure the per-segment cost on the largest segment, as Linux
+		// measures scaling_ratio on segments of at least rcv_mss.
+		if n > 0 && n >= e.rcvSegPayload {
+			e.rcvSegPayload, e.rcvSegMem = n, s.segMemSize()
+		}
 		s.IncRef()
 		e.rcvQueue.PushBack(s)
 	} else {
