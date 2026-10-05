@@ -206,6 +206,10 @@ func TestForwardTCPGSO(t *testing.T) {
 				if got, want := int(header.IPv6(v.AsSlice()).PayloadLength()), gsoFwdTCPLen+payloadLen; got != want {
 					t.Errorf("forwarded IPv6 payload length = %d, want %d", got, want)
 				}
+				wantXsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, remoteIPv6Addr1, remoteIPv6Addr2, uint16(gsoFwdTCPLen+payloadLen))
+				if got := header.TCP(header.IPv6(v.AsSlice()).Payload()).Checksum(); got != wantXsum {
+					t.Errorf("forwarded TCP checksum = %#x, want the partial checksum %#x for the host to complete", got, wantXsum)
+				}
 				if p := out.Read(); p != nil {
 					p.DecRef()
 					t.Errorf("got a second packet on the outgoing NIC, want one")
