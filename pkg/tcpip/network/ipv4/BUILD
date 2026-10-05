@@ -35,6 +35,7 @@ go_test(
     name = "ipv4_test",
     size = "small",
     srcs = [
+        "gso_forward_test.go",
         "igmp_test.go",
         "ipv4_test.go",
         "main_test.go",

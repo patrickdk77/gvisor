@@ -829,32 +829,56 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	newHdr.SetChecksum(0)
 	newHdr.SetChecksum(^newHdr.CalculateChecksum())
 
-	if route.RequiresTXTransportChecksum() {
-		newPkt.CalculateTransportChecksum()
+	pkts := []*stack.PacketBuffer{newPkt}
+	if newPkt.NeedsTCPSegmentation() {
+		mtu := forwardToEp.nic.MTU()
+		segSize := len(newHdr) + len(newPkt.TransportHeader().Slice()) + int(newPkt.GSOOptions.MSS)
+		if segSize > int(mtu) && newHdr.Flags()&header.IPv4FlagDontFragment != 0 {
+			// The segments of this GSO packet do not fit the outgoing link, so
+			// the sender must use smaller ones, as for a single oversized packet.
+			_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
+				mtu: mtu,
+			}, pkt, false /* deliveredLocally */)
+			return &ip.ErrMessageTooLong{}
+		}
+		if segSize > int(mtu) || !route.HasHostGSOCapability() || !newPkt.GSOOptions.NeedsCsum {
+			pkts = newPkt.SegmentTCPForForwarding(int(route.MaxHeaderLength()))
+			defer func() {
+				for _, p := range pkts {
+					p.DecRef()
+				}
+			}()
+		}
 	}
 
-	switch err := forwardToEp.writePacketPostRouting(route, newPkt, true /* headerIncluded */); err.(type) {
-	case nil:
-		return nil
-	case *tcpip.ErrMessageTooLong:
-		// As per RFC 792, page 4, Destination Unreachable:
-		//
-		//   Another case is when a datagram must be fragmented to be forwarded by a
-		//   gateway yet the Don't Fragment flag is on. In this case the gateway must
-		//   discard the datagram and may return a destination unreachable message.
-		//
-		// WriteHeaderIncludedPacket checks for the presence of the Don't Fragment bit
-		// while sending the packet and returns this error iff fragmentation is
-		// necessary and the bit is also set.
-		_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
-			mtu: forwardToEp.nic.MTU(),
-		}, pkt, false /* deliveredLocally */)
-		return &ip.ErrMessageTooLong{}
-	case *tcpip.ErrNoBufferSpace:
-		return &ip.ErrOutgoingDeviceNoBufferSpace{}
-	default:
-		return &ip.ErrOther{Err: err}
+	for _, p := range pkts {
+		if p == newPkt && route.RequiresTXTransportChecksum() {
+			newPkt.CalculateTransportChecksum()
+		}
+
+		switch err := forwardToEp.writePacketPostRouting(route, p, true /* headerIncluded */); err.(type) {
+		case nil:
+		case *tcpip.ErrMessageTooLong:
+			// As per RFC 792, page 4, Destination Unreachable:
+			//
+			//   Another case is when a datagram must be fragmented to be forwarded by a
+			//   gateway yet the Don't Fragment flag is on. In this case the gateway must
+			//   discard the datagram and may return a destination unreachable message.
+			//
+			// WriteHeaderIncludedPacket checks for the presence of the Don't Fragment bit
+			// while sending the packet and returns this error iff fragmentation is
+			// necessary and the bit is also set.
+			_ = e.protocol.returnError(&icmpReasonFragmentationNeeded{
+				mtu: forwardToEp.nic.MTU(),
+			}, pkt, false /* deliveredLocally */)
+			return &ip.ErrMessageTooLong{}
+		case *tcpip.ErrNoBufferSpace:
+			return &ip.ErrOutgoingDeviceNoBufferSpace{}
+		default:
+			return &ip.ErrOther{Err: err}
+		}
 	}
+	return nil
 }
 
 // forwardUnicastPacket attempts to forward a packet to its final destination.

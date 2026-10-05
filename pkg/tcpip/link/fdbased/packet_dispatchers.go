@@ -18,6 +18,8 @@
 package fdbased
 
 import (
+	"encoding/binary"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/rawfile"
@@ -53,6 +55,10 @@ type iovecBuffer struct {
 	// skipsVnetHdr is true if virtioNetHdr is to skipped.
 	skipsVnetHdr bool
 
+	// vnetHdr receives the virtioNetHdr of the last packet read, when
+	// skipsVnetHdr is true.
+	vnetHdr [virtioNetHdrSize]byte `state:"nosave"`
+
 	// pulledIndex is the index of the last []byte buffer pulled from the
 	// underlying buffer storage during a call to pullBuffers. It is -1
 	// if no buffer is pulled.
@@ -76,11 +82,9 @@ func newIovecBuffer(sizes []int, skipsVnetHdr bool) *iovecBuffer {
 func (b *iovecBuffer) nextIovecs() []unix.Iovec {
 	vnetHdrOff := 0
 	if b.skipsVnetHdr {
-		var vnetHdr [virtioNetHdrSize]byte
-		// The kernel adds virtioNetHdr before each packet, but
-		// we don't use it, so we allocate a buffer for it,
-		// add it in iovecs but don't add it in a view.
-		b.iovecs[0] = unix.Iovec{Base: &vnetHdr[0]}
+		// The kernel adds virtioNetHdr before each packet. It goes in its
+		// own iovec rather than a view, and gso() reads it back.
+		b.iovecs[0] = unix.Iovec{Base: &b.vnetHdr[0]}
 		b.iovecs[0].SetLen(virtioNetHdrSize)
 		vnetHdrOff++
 	}
@@ -134,6 +138,32 @@ func (b *iovecBuffer) pullBuffer(n int) buffer.Buffer {
 	}
 	pulled.Truncate(int64(n))
 	return pulled
+}
+
+// gso returns the GSO metadata in the virtioNetHdr of the last packet read
+// into b, the inverse of what writePacket puts in the header it sends.
+// linkHdrSize is the size of the link header before the network header.
+//
+// Preconditions: b.skipsVnetHdr.
+func (b *iovecBuffer) gso(linkHdrSize int) stack.GSO {
+	var gso stack.GSO
+	switch b.vnetHdr[1] &^ _VIRTIO_NET_HDR_GSO_ECN {
+	case _VIRTIO_NET_HDR_GSO_TCPV4:
+		gso.Type = stack.GSOTCPv4
+	case _VIRTIO_NET_HDR_GSO_TCPV6:
+		gso.Type = stack.GSOTCPv6
+	default:
+		return stack.GSO{}
+	}
+	gso.MSS = binary.LittleEndian.Uint16(b.vnetHdr[4:])
+	if b.vnetHdr[0]&_VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
+		gso.NeedsCsum = true
+		gso.CsumOffset = binary.LittleEndian.Uint16(b.vnetHdr[8:])
+		if csumStart := int(binary.LittleEndian.Uint16(b.vnetHdr[6:])); csumStart > linkHdrSize {
+			gso.L3HdrLen = uint16(csumStart - linkHdrSize)
+		}
+	}
+	return gso
 }
 
 func (b *iovecBuffer) release() {
@@ -201,6 +231,9 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 		Payload: d.buf.pullBuffer(n),
 	})
 	defer pkt.DecRef()
+	if d.buf.skipsVnetHdr {
+		pkt.GSOOptions = d.buf.gso(d.e.hdrSize)
+	}
 
 	d.e.mu.RLock()
 	addr := d.e.addr
@@ -322,6 +355,9 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: d.bufs[k].pullBuffer(n),
 		})
+		if d.bufs[k].skipsVnetHdr {
+			pkt.GSOOptions = d.bufs[k].gso(d.e.hdrSize)
+		}
 		d.pkts.PushBack(pkt)
 
 		// Mark that this iovec has been processed.

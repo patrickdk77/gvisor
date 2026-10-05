@@ -67,6 +67,7 @@ go_test(
     srcs = [
         "endpoint_test.go",
         "processors_test.go",
+        "vnet_rx_test.go",
     ],
     library = ":fdbased",
     deps = [

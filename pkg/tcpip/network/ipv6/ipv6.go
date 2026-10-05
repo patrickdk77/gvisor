@@ -1211,21 +1211,42 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		return &ip.ErrUnknownOutputEndpoint{}
 	}
 
-	switch err := forwardToEp.writePacket(route, newPkt, newPkt.TransportProtocolNumber, true /* headerIncluded */); err.(type) {
-	case nil:
-		return nil
-	case *tcpip.ErrMessageTooLong:
-		// As per RFC 4443, section 3.2:
-		//   A Packet Too Big MUST be sent by a router in response to a packet that
-		//   it cannot forward because the packet is larger than the MTU of the
-		//   outgoing link.
-		_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, pkt, false /* deliveredLocally */)
-		return &ip.ErrMessageTooLong{}
-	case *tcpip.ErrNoBufferSpace:
-		return &ip.ErrOutgoingDeviceNoBufferSpace{}
-	default:
-		return &ip.ErrOther{Err: err}
+	pkts := []*stack.PacketBuffer{newPkt}
+	if newPkt.NeedsTCPSegmentation() {
+		segSize := len(newPkt.NetworkHeader().Slice()) + len(newPkt.TransportHeader().Slice()) + int(newPkt.GSOOptions.MSS)
+		if segSize > int(forwardToEp.nic.MTU()) {
+			// The segments of this GSO packet do not fit the outgoing link, so
+			// the sender must use smaller ones, as for a single oversized packet.
+			_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, pkt, false /* deliveredLocally */)
+			return &ip.ErrMessageTooLong{}
+		}
+		if !route.HasHostGSOCapability() || !newPkt.GSOOptions.NeedsCsum {
+			pkts = newPkt.SegmentTCPForForwarding(int(route.MaxHeaderLength()))
+			defer func() {
+				for _, p := range pkts {
+					p.DecRef()
+				}
+			}()
+		}
 	}
+
+	for _, p := range pkts {
+		switch err := forwardToEp.writePacket(route, p, p.TransportProtocolNumber, true /* headerIncluded */); err.(type) {
+		case nil:
+		case *tcpip.ErrMessageTooLong:
+			// As per RFC 4443, section 3.2:
+			//   A Packet Too Big MUST be sent by a router in response to a packet that
+			//   it cannot forward because the packet is larger than the MTU of the
+			//   outgoing link.
+			_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, pkt, false /* deliveredLocally */)
+			return &ip.ErrMessageTooLong{}
+		case *tcpip.ErrNoBufferSpace:
+			return &ip.ErrOutgoingDeviceNoBufferSpace{}
+		default:
+			return &ip.ErrOther{Err: err}
+		}
+	}
+	return nil
 }
 
 // HandlePacket is called by the link layer when new ipv6 packets arrive for

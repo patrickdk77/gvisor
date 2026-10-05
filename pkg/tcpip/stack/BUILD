@@ -216,6 +216,7 @@ go_library(
         "conn_track_mutex.go",
         "conntrack.go",
         "endpoints_by_nic_mutex.go",
+        "gso_segment.go",
         "headertype_string.go",
         "hook_string.go",
         "icmp_rate_limit.go",
