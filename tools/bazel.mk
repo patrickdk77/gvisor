@@ -330,6 +330,7 @@ endif
 	@$(DOCKER_CLI_PATH) run -d \
 	  --name $(DOCKER_NAME) --hostname $(DOCKER_HOSTNAME) \
 	  -v "$(CURDIR):$(CURDIR)" \
+	  -v "$(CURDIR)/tools/bazel_job_cap.sh:/usr/local/sbin/bazel:ro" \
 	  --workdir "$(CURDIR)" \
 	  --pid=host \
 	  $(DOCKER_RUN_OPTIONS) \
