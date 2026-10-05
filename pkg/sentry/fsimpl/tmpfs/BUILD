@@ -106,7 +106,6 @@ go_library(
     marshal = True,
     visibility = ["//pkg/sentry:internal"],
     deps = [
-        "//pkg/sentry/confine",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
@@ -121,6 +120,7 @@ go_library(
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/checkpoint",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
         "//pkg/sentry/fsutil",

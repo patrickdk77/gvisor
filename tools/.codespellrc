@@ -33,6 +33,8 @@ ignore-words-list =
   te,
   tru,
   # abbreviations that are correct in context.
+  # AARE is AppArmor's regular expression syntax.
+  AARE,
   cacl,
   flate,
   hart,
@@ -45,6 +47,8 @@ ignore-words-list =
   # AtLeast is version.AtLeast; lowercase "atleast" stays a typo.
   AtLeast,
   # truncated words in test data and expected output.
+  # caf is "cafe" with its accented e spelled out as UTF-8 bytes.
+  caf,
   hel,
   packe,
   protestors,

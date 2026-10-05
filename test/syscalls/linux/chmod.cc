@@ -304,7 +304,6 @@ TEST(ChmodTest, ChmodWritableWithOpenFD) {
   EXPECT_THAT(WriteFd(fd2.get(), &c, 1), SyscallSucceedsWithValue(1));
 }
 
-
 // fchmodat2(2) is syscall 452 and is not in glibc on every distribution, so it
 // is called directly.
 int fchmodat2(int dirfd, const char* path, mode_t mode, int flags) {
@@ -312,8 +311,8 @@ int fchmodat2(int dirfd, const char* path, mode_t mode, int flags) {
 }
 
 TEST(ChmodTest, Fchmodat2ChangesMode) {
-  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
-      GetAbsoluteTestTmpdir(), "", 0666));
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "", 0666));
   SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0444, 0) < 0 &&
           errno == ENOSYS);
 
@@ -344,9 +343,9 @@ TEST(ChmodTest, Fchmodat2SymlinkNofollowIsUnsupported) {
   // A symlink has no mode of its own to change, which chmod(2) records as
   // AT_SYMLINK_NOFOLLOW being "not currently supported by any filesystem, so
   // specifying it will result in an EOPNOTSUPP error".
-  EXPECT_THAT(fchmodat2(AT_FDCWD, link.path().c_str(), 0600,
-                        AT_SYMLINK_NOFOLLOW),
-              SyscallFailsWithErrno(EOPNOTSUPP));
+  EXPECT_THAT(
+      fchmodat2(AT_FDCWD, link.path().c_str(), 0600, AT_SYMLINK_NOFOLLOW),
+      SyscallFailsWithErrno(EOPNOTSUPP));
 
   // Following the link changes the target instead.
   ASSERT_THAT(fchmodat2(AT_FDCWD, link.path().c_str(), 0600, 0),
@@ -357,15 +356,14 @@ TEST(ChmodTest, Fchmodat2SymlinkNofollowIsUnsupported) {
 }
 
 TEST(ChmodTest, Fchmodat2EmptyPath) {
-  const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
-      GetAbsoluteTestTmpdir(), "", 0666));
+  const auto file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "", 0666));
   SKIP_IF(fchmodat2(AT_FDCWD, file.path().c_str(), 0666, 0) < 0 &&
           errno == ENOSYS);
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
 
-  ASSERT_THAT(fchmodat2(fd.get(), "", 0640, AT_EMPTY_PATH),
-              SyscallSucceeds());
+  ASSERT_THAT(fchmodat2(fd.get(), "", 0640, AT_EMPTY_PATH), SyscallSucceeds());
   struct stat st;
   ASSERT_THAT(stat(file.path().c_str(), &st), SyscallSucceeds());
   EXPECT_EQ(st.st_mode & 07777, 0640);

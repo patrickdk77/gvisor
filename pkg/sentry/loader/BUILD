@@ -18,7 +18,6 @@ go_library(
     marshal_debug = True,
     visibility = ["//pkg/sentry:internal"],
     deps = [
-        "//pkg/sentry/confine",
         "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
@@ -31,6 +30,7 @@ go_library(
         "//pkg/rand",
         "//pkg/safemem",
         "//pkg/sentry/arch",
+        "//pkg/sentry/confine",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader/vdsodata",

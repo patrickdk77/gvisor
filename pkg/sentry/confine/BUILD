@@ -28,12 +28,12 @@ go_test(
     name = "confine_test",
     size = "medium",
     srcs = [
-        "confine_test.go",
-        "stress_test.go",
-        "wildcard_bench_test.go",
         "bench_test.go",
+        "confine_test.go",
         "dfa_test.go",
         "reference_test.go",
+        "stress_test.go",
+        "wildcard_bench_test.go",
     ],
     data = [
         "testdata/aare_reference.tsv",

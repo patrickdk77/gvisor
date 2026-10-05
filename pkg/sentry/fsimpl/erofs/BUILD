@@ -55,7 +55,6 @@ go_library(
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
-        "//pkg/sentry/confine",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/cleanup",
@@ -68,6 +67,7 @@ go_library(
         "//pkg/refs",
         "//pkg/safemem",
         "//pkg/sentry/checkpoint",
+        "//pkg/sentry/confine",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsutil",
         "//pkg/sentry/hostfd",
